@@ -1,3 +1,10 @@
 /weekly-insights
 /dist/
 *.out
+
+# Never commit credentials. The tool stores its token outside the repo
+# (user config dir or keychain); these rules are a backstop only.
+.env
+.env.*
+token
+*.token

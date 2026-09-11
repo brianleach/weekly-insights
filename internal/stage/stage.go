@@ -38,7 +38,7 @@ type Inputs struct {
 }
 
 // skip lists the config-dir entries the stage replaces rather than shares.
-var skip = map[string]bool{"projects": true, "usage-data": true, ".claude.json": true}
+var skip = map[string]bool{"projects": true, "usage-data": true, ".claude.json": true, ".credentials.json": true}
 
 // Build populates dst, which must be empty or absent.
 func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
@@ -53,6 +53,14 @@ func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
 	// would let it race the live session that owns the real one.
 	if err := copyFile(in.AccountFile, filepath.Join(dst, ".claude.json"), 0o600); err != nil && !os.IsNotExist(err) {
 		return c, fmt.Errorf("staging account file: %w", err)
+	}
+	// On platforms without a keychain, Claude Code keeps credentials in a file
+	// inside the config dir. Carrying it along means the child is simply logged
+	// in and no separate token is needed. Absent on macOS, where the keychain
+	// holds it.
+	cred := filepath.Join(in.Paths.ClaudeHome, ".credentials.json")
+	if err := copyFile(cred, filepath.Join(dst, ".credentials.json"), 0o600); err != nil && !os.IsNotExist(err) {
+		return c, fmt.Errorf("staging credentials file: %w", err)
 	}
 
 	sp := store.Paths{Root: filepath.Join(dst, "usage-data"), ClaudeHome: dst}

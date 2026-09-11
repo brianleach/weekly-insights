@@ -14,16 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
 	"github.com/brianleach/weekly-insights/internal/store"
 )
-
-// KeychainService is the macOS keychain item the runner reads a token from
-// when CLAUDE_CODE_OAUTH_TOKEN is not already set.
-const KeychainService = "weekly-insights"
 
 // ErrNotLoggedIn is returned when the child could not authenticate.
 var ErrNotLoggedIn = errors.New("the staged Claude Code run was not logged in")
@@ -33,7 +28,7 @@ type Options struct {
 	Real      store.Paths // the user's real config, for harvesting caches back
 	Stage     string      // populated by package stage
 	ClaudeBin string      // defaults to "claude"
-	Token     string      // optional; see ResolveToken
+	Token     string      // optional; resolved by package auth
 	OutPath   string      // where to copy the finished report
 	Stderr    io.Writer   // child stderr passthrough; nil discards
 }
@@ -114,23 +109,6 @@ func childEnv(o Options) []string {
 		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+o.Token)
 	}
 	return env
-}
-
-// ResolveToken finds a long-lived token for the child: the environment first,
-// then the macOS keychain item named KeychainService. The token is returned to
-// the caller only to be placed in the child's environment; it is never logged.
-func ResolveToken() string {
-	if t := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); t != "" {
-		return t
-	}
-	if runtime.GOOS != "darwin" {
-		return ""
-	}
-	out, err := exec.Command("security", "find-generic-password", "-s", KeychainService, "-w").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func newestReport(usageData string) (string, error) {

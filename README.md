@@ -45,24 +45,43 @@ library only, no cgo.
 
 ## Authentication
 
-A staged config directory cannot see the login stored for your real one (on macOS
-the keychain entry is tied to the config dir), so the child needs a long-lived token
-minted on your subscription. One-time setup:
+A staged config directory cannot see the login stored for your real one, so the
+child needs a long-lived token minted on your subscription (not API billing).
+One-time setup, two commands:
 
 ```
-claude setup-token
+claude setup-token        # interactive; prints a token
+weekly-insights auth      # paste it; stored in the right place for your platform
 ```
 
-Store the token it prints in the macOS keychain under the service name
-`weekly-insights`:
+Where it goes:
 
-```
-security add-generic-password -a "$USER" -s weekly-insights -w '<token>' -U
-```
+| Platform | Storage |
+|---|---|
+| macOS | keychain item `weekly-insights` |
+| Linux | `$XDG_CONFIG_HOME/weekly-insights/token` (default `~/.config/...`), mode 0600 |
+| Windows | `%AppData%\weekly-insights\token` |
 
-The tool reads it from there on each run. Setting `CLAUDE_CODE_OAUTH_TOKEN` in the
-environment works too. The token is never written anywhere by this tool, and the
-stage that holds the copied account file is removed when the run ends.
+`weekly-insights auth --check` says whether a token is available and where, without
+printing it. `--clear` removes it. Setting `CLAUDE_CODE_OAUTH_TOKEN` in the
+environment overrides storage for a single run.
+
+The token is stored outside any repository on purpose. A `.env` in a checkout is one
+careless `git add` from being committed, and the binary is run from arbitrary
+directories anyway, so it would not be found. The repository's `.gitignore` excludes
+`.env` and `token` files regardless, as a backstop.
+
+On Linux you may not need a token at all: Claude Code there keeps credentials in a
+file inside the config directory, and the stage carries that file along. This is
+untested; if the run reports "not logged in", use the token.
+
+The stage, which holds a copy of your account file, is removed when the run ends.
+
+## Platform support
+
+macOS is tested. Linux should work and has not been exercised. Windows is not
+supported: the stage symlinks your shared config entries, and creating symlinks on
+Windows needs Developer Mode or elevation. `make dist` builds darwin and linux only.
 
 ## Usage
 

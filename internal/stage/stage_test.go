@@ -27,6 +27,8 @@ func fakeHome(t *testing.T) (store.Paths, string) {
 	}
 	must(os.WriteFile(filepath.Join(ch, "settings.json"), []byte(`{}`), 0o644))
 	must(os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"oauthAccount":{}}`), 0o600))
+	// Linux-style credentials file inside the config dir.
+	must(os.WriteFile(filepath.Join(ch, ".credentials.json"), []byte(`{"k":"v"}`), 0o600))
 	proj := filepath.Join(ch, "projects", "-Users-me-code")
 	must(os.WriteFile(filepath.Join(proj, "aaa.jsonl"), []byte(`{}`), 0o644))
 	must(os.MkdirAll(filepath.Join(proj, "aaa"), 0o755))
@@ -66,9 +68,20 @@ func TestBuildStagesOnlyTheWindow(t *testing.T) {
 			t.Errorf("%s must be a real directory owned by the stage", name)
 		}
 	}
-	// The account file is a copy, never a link.
-	if fi, err := os.Lstat(filepath.Join(dst, ".claude.json")); err != nil || fi.Mode()&os.ModeSymlink != 0 {
-		t.Error(".claude.json must be copied, not linked")
+	// The account and credentials files are copies, never links: the child
+	// rewrites them on exit and must not race the live session's originals.
+	for _, name := range []string{".claude.json", ".credentials.json"} {
+		fi, err := os.Lstat(filepath.Join(dst, name))
+		if err != nil {
+			t.Errorf("%s missing from stage", name)
+			continue
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			t.Errorf("%s must be copied, not linked", name)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode = %o, want 0600", name, fi.Mode().Perm())
+		}
 	}
 
 	proj := filepath.Join(dst, "projects", "-Users-me-code")

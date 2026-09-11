@@ -11,15 +11,18 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/brianleach/weekly-insights/internal/auth"
 	"github.com/brianleach/weekly-insights/internal/prompt"
 	"github.com/brianleach/weekly-insights/internal/report"
 	"github.com/brianleach/weekly-insights/internal/runner"
@@ -41,6 +44,7 @@ Usage:
 
 Commands:
   insights    run the real Claude Code /insights over a time window
+  auth        store the token insights needs (--check to verify, --clear to remove)
   select      show what is in the window and how many sessions need facets
   prepare     render the window's transcripts to text for facet extraction
   aggregate   build and save a snapshot of the window
@@ -62,6 +66,8 @@ func main() {
 	switch os.Args[1] {
 	case "insights":
 		err = cmdInsights(os.Args[2:])
+	case "auth":
+		err = cmdAuth(os.Args[2:])
 	case "select":
 		err = cmdSelect(os.Args[2:])
 	case "prepare":
@@ -186,8 +192,9 @@ func cmdInsights(args []string) error {
 
 	name := fmt.Sprintf("insights-%dd-%s.html", o.Days, r.End.Format("2006-01-02"))
 	fmt.Fprintln(os.Stderr, "running claude -p /insights against the stage; this takes a few minutes ...")
+	token, _ := auth.Resolve()
 	res, err := runner.Run(runner.Options{
-		Real: p, Stage: st, ClaudeBin: *claudeBin, Token: runner.ResolveToken(),
+		Real: p, Stage: st, ClaudeBin: *claudeBin, Token: token,
 		OutPath: filepath.Join(*outDir, name), Stderr: os.Stderr,
 	})
 	if err == runner.ErrNotLoggedIn {
@@ -196,11 +203,10 @@ func cmdInsights(args []string) error {
 A staged config directory cannot see the login stored for the real one, so the
 child needs a long-lived token minted on your subscription. One-time setup:
 
-  1. run:  claude setup-token
-  2. store the token it prints in the macOS keychain under the service name
-     %q (see README, "Authentication"), or export it as CLAUDE_CODE_OAUTH_TOKEN.
+  1. in another terminal:  claude setup-token
+  2. then here:            weekly-insights auth      (paste the token it printed)
 
-The token is read at run time and never written anywhere by this tool.`, err, runner.KeychainService)
+%s in the environment also works for a single run.`, err, auth.EnvVar)
 	}
 	if err != nil {
 		return err
@@ -209,9 +215,70 @@ The token is read at run time and never written anywhere by this tool.`, err, ru
 		res.HarvestedMeta, res.HarvestedFacets)
 	fmt.Println(res.Report)
 	if *openIt {
-		_ = exec.Command("open", res.Report).Start()
+		openPath(res.Report)
 	}
 	return nil
+}
+
+// cmdAuth stores the token once so the README setup is two lines instead of a
+// platform-specific keychain incantation.
+func cmdAuth(args []string) error {
+	fs := flag.NewFlagSet("auth", flag.ExitOnError)
+	check := fs.Bool("check", false, "report whether a token is available and where, without printing it")
+	clear := fs.Bool("clear", false, "remove any stored token")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch {
+	case *clear:
+		if err := auth.Clear(); err != nil {
+			return err
+		}
+		fmt.Println("stored token removed")
+		return nil
+	case *check:
+		if _, src := auth.Resolve(); src != auth.SourceNone {
+			fmt.Printf("token available (%s)\n", src)
+			return nil
+		}
+		return fmt.Errorf("no token found; run \"weekly-insights auth\"")
+	}
+
+	fmt.Fprintln(os.Stderr, "Run \"claude setup-token\" in another terminal, then paste the token it prints.")
+	fmt.Fprintln(os.Stderr, "(input is not hidden; clear your terminal afterwards if that matters)")
+	fmt.Fprint(os.Stderr, "Token: ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return fmt.Errorf("reading token: %w", err)
+	}
+	src, err := auth.Store(line)
+	if err != nil {
+		return err
+	}
+	where := string(src)
+	if src == auth.SourceFile {
+		if p, e := auth.Path(); e == nil {
+			where = p
+		}
+	}
+	fmt.Fprintf(os.Stderr, "token stored (%s)\n", where)
+	return nil
+}
+
+// openPath opens a file with the platform's default handler. Failures are
+// ignored: the path was already printed, and a missing opener is not a reason
+// to fail a run that produced its report.
+func openPath(p string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", p)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", p)
+	default:
+		cmd = exec.Command("xdg-open", p)
+	}
+	_ = cmd.Start()
 }
 
 func cmdSelect(args []string) error {
