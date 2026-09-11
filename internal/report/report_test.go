@@ -184,30 +184,60 @@ func TestWeeklyOmitsEmptyOptionalSections(t *testing.T) {
 	mustNotContain(t, got, "### What you had to correct", "### Friction detail")
 }
 
-func TestWeeklyCorrectionsAndDetailsAreCapped(t *testing.T) {
+func TestWeeklyKeepsEveryCorrectionAndDetail(t *testing.T) {
+	// These two sections are read line by line, so nothing may be dropped.
+	// A flat capped list used to be dominated by whichever day had the most
+	// sessions, silently hiding the rest of the week.
 	cur := base()
 	for i := 0; i < 20; i++ {
+		day := "2026-09-07"
+		if i >= 10 {
+			day = "2026-09-09"
+		}
 		cur.UserCorrections = append(cur.UserCorrections, snapshot.UserCorrection{
-			Session: "s", Date: "2026-09-07", Quote: quoteFor(i),
+			Session: "s", Date: day, Quote: quoteFor(i),
 		})
 		cur.FrictionDetails = append(cur.FrictionDetails, snapshot.FrictionDetail{
-			Session: "s", Date: "2026-09-07", Project: "alpha", Detail: quoteFor(i),
+			Session: "s", Date: day, Project: "alpha", Detail: quoteFor(i),
 		})
 	}
 
 	got := Weekly(cur, nil)
 
-	mustContain(t, got,
-		"### What you had to correct",
-		"- `2026-09-07` \"q0\"",
-		"### Friction detail",
-		"- **2026-09-07 alpha** — q0",
-	)
-	// Caps are 15 corrections and 12 details.
-	mustContain(t, got, "\"q14\"")
-	mustNotContain(t, got, "\"q15\"")
-	mustContain(t, got, "— q11")
-	mustNotContain(t, got, "— q12")
+	// Headings carry the total so a reader can tell at a glance how much there is.
+	mustContain(t, got, "### What you had to correct (20)", "### Friction detail (20)")
+
+	// Every entry survives, including the last one on the later day.
+	for i := 0; i < 20; i++ {
+		mustContain(t, got, "\""+quoteFor(i)+"\"")
+		mustContain(t, got, "— "+quoteFor(i))
+	}
+
+	// Corrections are grouped under a date heading, oldest day first.
+	mustContain(t, got, "**2026-09-07**", "**2026-09-09**")
+	if strings.Index(got, "**2026-09-07**") > strings.Index(got, "**2026-09-09**") {
+		t.Error("correction day groups are not in ascending date order")
+	}
+}
+
+func TestWeeklyGroupsCorrectionsByDayNotSessionOrder(t *testing.T) {
+	// Snapshot order follows session order, which interleaves days. The report
+	// must still group them, or a reader scanning by date sees duplicates.
+	cur := base()
+	for _, d := range []string{"2026-09-09", "2026-09-07", "2026-09-09", "2026-09-07"} {
+		cur.UserCorrections = append(cur.UserCorrections, snapshot.UserCorrection{
+			Session: "s", Date: d, Quote: d + "-q",
+		})
+	}
+
+	got := Weekly(cur, nil)
+
+	if n := strings.Count(got, "**2026-09-07**"); n != 1 {
+		t.Errorf("expected one heading for 2026-09-07, got %d", n)
+	}
+	if n := strings.Count(got, "**2026-09-09**"); n != 1 {
+		t.Errorf("expected one heading for 2026-09-09, got %d", n)
+	}
 }
 
 func TestTrend(t *testing.T) {

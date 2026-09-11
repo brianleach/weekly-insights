@@ -136,19 +136,29 @@ func Weekly(cur snapshot.Snapshot, prev *snapshot.Snapshot) string {
 	}
 	line("")
 
+	// Corrections and friction detail are the sections people actually read
+	// line by line, so nothing is dropped. They are grouped by day because a
+	// flat capped list gets dominated by whichever day had the most sessions,
+	// silently hiding the rest of the week.
 	if len(cur.UserCorrections) > 0 {
-		line("### What you had to correct")
+		line(fmt.Sprintf("### What you had to correct (%d)", len(cur.UserCorrections)))
 		line("")
-		for _, c := range cur.UserCorrections[:min(15, len(cur.UserCorrections))] {
-			line(fmt.Sprintf("- `%s` \"%s\"", c.Date, c.Quote))
+		for _, day := range byDay(len(cur.UserCorrections), func(i int) string {
+			return cur.UserCorrections[i].Date
+		}) {
+			line(fmt.Sprintf("**%s**", day.date))
+			line("")
+			for _, i := range day.idx {
+				line(fmt.Sprintf("- \"%s\"", cur.UserCorrections[i].Quote))
+			}
+			line("")
 		}
-		line("")
 	}
 
 	if len(cur.FrictionDetails) > 0 {
-		line("### Friction detail")
+		line(fmt.Sprintf("### Friction detail (%d)", len(cur.FrictionDetails)))
 		line("")
-		for _, f := range cur.FrictionDetails[:min(12, len(cur.FrictionDetails))] {
+		for _, f := range cur.FrictionDetails {
 			// The em dash here is a literal separator, matching the reference.
 			line(fmt.Sprintf("- **%s %s** — %s", f.Date, f.Project, f.Detail))
 		}
@@ -282,6 +292,31 @@ func num(v float64) string {
 		return fmt.Sprintf("%.2f", v)
 	}
 	return fmt.Sprintf("%.1f", v)
+}
+
+// dayGroup is a date and the indexes of the entries falling on it.
+type dayGroup struct {
+	date string
+	idx  []int
+}
+
+// byDay groups entry indexes by date, preserving both the order dates first
+// appear and the order of entries within a date.
+func byDay(n int, dateOf func(int) string) []dayGroup {
+	var out []dayGroup
+	pos := map[string]int{}
+	for i := 0; i < n; i++ {
+		d := dateOf(i)
+		j, seen := pos[d]
+		if !seen {
+			pos[d] = len(out)
+			out = append(out, dayGroup{date: d, idx: []int{i}})
+			continue
+		}
+		out[j].idx = append(out[j].idx, i)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].date < out[b].date })
+	return out
 }
 
 func round2(v float64) float64 {
