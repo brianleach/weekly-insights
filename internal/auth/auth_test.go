@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -123,5 +125,198 @@ func TestPathIsOutsideAnyRepoCheckout(t *testing.T) {
 	wd, _ := os.Getwd()
 	if strings.HasPrefix(p, wd) {
 		t.Errorf("token path %s is under the working directory %s", p, wd)
+	}
+}
+
+// stubKeychain turns the keychain path on and routes it at a fake `security`,
+// so the macOS branches are testable on any platform and never touch a real
+// keychain.
+func stubKeychain(t *testing.T, fn func(args ...string) ([]byte, error)) *[][]string {
+	t.Helper()
+	var calls [][]string
+	oldEnabled, oldRun := keychainEnabled, runSecurity
+	keychainEnabled = true
+	runSecurity = func(args ...string) ([]byte, error) {
+		calls = append(calls, args)
+		return fn(args...)
+	}
+	t.Cleanup(func() { keychainEnabled, runSecurity = oldEnabled, oldRun })
+	return &calls
+}
+
+func TestResolveUsesKeychain(t *testing.T) {
+	isolate(t)
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		if args[0] != "find-generic-password" {
+			t.Errorf("unexpected security call %v", args)
+		}
+		return []byte(sample + "\n"), nil
+	})
+	tok, src := Resolve()
+	if tok != sample || src != SourceKeychain {
+		t.Errorf("Resolve = %q from %q; want the keychain token", tok, src)
+	}
+}
+
+func TestStoreUsesKeychain(t *testing.T) {
+	isolate(t)
+	calls := stubKeychain(t, func(args ...string) ([]byte, error) { return nil, nil })
+	src, err := Store(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != SourceKeychain {
+		t.Errorf("Store reported %q, want %q", src, SourceKeychain)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected one security call, got %d", len(*calls))
+	}
+	args := (*calls)[0]
+	if args[0] != "add-generic-password" {
+		t.Errorf("called security %q, want add-generic-password", args[0])
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-s "+KeychainService) {
+		t.Errorf("service flag missing from %v", args)
+	}
+	var sawUpdate bool
+	for _, a := range args {
+		if a == "-U" {
+			sawUpdate = true
+		}
+	}
+	if !sawUpdate {
+		t.Errorf("-U missing from %v; an existing item would not be updated", args)
+	}
+	p, _ := Path()
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("keychain store should not have written the fallback file %s", p)
+	}
+}
+
+func TestStoreFallsBackToFileWhenKeychainFails(t *testing.T) {
+	isolate(t)
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return []byte("no login keychain"), errors.New("exit status 1")
+	})
+	src, err := Store(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != SourceFile {
+		t.Errorf("Store reported %q, want %q when the keychain fails", src, SourceFile)
+	}
+	p, _ := Path()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(b)) != sample {
+		t.Errorf("fallback file holds %q", strings.TrimSpace(string(b)))
+	}
+}
+
+func TestClearIgnoresMissingKeychainItem(t *testing.T) {
+	isolate(t)
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return []byte("security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."),
+			errors.New("exit status 44")
+	})
+	if err := Clear(); err != nil {
+		t.Errorf("Clear should ignore a missing keychain item, got %v", err)
+	}
+}
+
+func TestClearIgnoresNotFoundInErrorText(t *testing.T) {
+	isolate(t)
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return nil, errors.New("The specified item could not be found in the keychain.")
+	})
+	if err := Clear(); err != nil {
+		t.Errorf("Clear should ignore a not-found error, got %v", err)
+	}
+}
+
+func TestClearPropagatesKeychainError(t *testing.T) {
+	isolate(t)
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return []byte("User interaction is not allowed."), errors.New("exit status 36")
+	})
+	err := Clear()
+	if err == nil {
+		t.Fatal("Clear must not report success when the keychain delete fails")
+	}
+	if !strings.Contains(err.Error(), "delete-generic-password") {
+		t.Errorf("error lacks context: %v", err)
+	}
+}
+
+func TestPromptTokenReadsPipedInput(t *testing.T) {
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader("  "+sample+"  \nleftover\n"), &out, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+	if !strings.Contains(out.String(), "claude setup-token") {
+		t.Errorf("instructions missing from prompt output %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Token: ") {
+		t.Errorf("prompt missing from output %q", out.String())
+	}
+}
+
+func TestPromptTokenAcceptsUnterminatedLine(t *testing.T) {
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(sample), &out, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+}
+
+func TestPromptTokenEmptyInputErrors(t *testing.T) {
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(""), &out, false)
+	if err == nil {
+		t.Fatal("expected an error on empty input")
+	}
+	if tok != "" {
+		t.Errorf("PromptToken returned %q on error", tok)
+	}
+	if strings.Contains(err.Error(), sample) {
+		t.Errorf("error text leaked the token: %v", err)
+	}
+}
+
+func TestClearIgnoresExitCode44(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no sh to produce a real exit status")
+	}
+	isolate(t)
+	// A real *exec.ExitError, so the exit-code branch is covered rather than
+	// only the message substring.
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return exec.Command("sh", "-c", "exit 44").CombinedOutput()
+	})
+	if err := Clear(); err != nil {
+		t.Errorf("Clear should ignore exit status 44, got %v", err)
+	}
+}
+
+func TestClearPropagatesOtherExitCodes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no sh to produce a real exit status")
+	}
+	isolate(t)
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return exec.Command("sh", "-c", "exit 36").CombinedOutput()
+	})
+	if err := Clear(); err == nil {
+		t.Error("Clear must propagate a non-not-found exit status")
 	}
 }

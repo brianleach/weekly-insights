@@ -172,15 +172,29 @@ func (p Paths) TranscriptPath(sessionID string) string {
 }
 
 // WriteJSON writes v to path, creating parent directories as needed.
+//
+// Permissions are owner-only. Snapshots carry verbatim user corrections and
+// friction detail quoted out of transcripts, which is the user's own writing
+// about their own work and has no business being world-readable on a shared
+// machine. MkdirAll only applies its mode to directories it creates, so a
+// directory that already exists keeps whatever mode it had.
 func WriteJSON(path string, v any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("creating directory for %s: %w", path, err)
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding %s: %w", path, err)
 	}
-	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+	// os.WriteFile applies its mode only when it creates the file, so a
+	// snapshot written by an earlier version stays 0644 forever unless it is
+	// chmodded here.
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("tightening permissions on %s: %w", path, err)
+		}
+	}
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil

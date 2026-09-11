@@ -144,12 +144,26 @@ func indent(s string) string {
 // Options for one model run.
 type Options struct {
 	ClaudeBin string    // defaults to "claude"
+	Token     string    // optional; resolved by package auth, never logged
 	Stderr    io.Writer // child stderr passthrough; nil discards
 }
+
+// ErrExec wraps a failure of the child process itself: it could not start, or
+// it exited nonzero. Whatever it printed is not an answer, so a caller must
+// fail rather than fall back to it.
+var ErrExec = errors.New("the progress run failed")
+
+// ErrParse wraps a child that succeeded but whose reply was not the expected
+// JSON. The raw reply is still the model's answer, so a caller may keep it.
+var ErrParse = errors.New("the model's reply could not be parsed")
 
 // Run asks the user's own Claude Code for the memo. It runs against the real
 // config directory with the default model, so the judgment comes from the
 // same place the weekly reports did.
+//
+// The returned error is ErrExec-wrapped when the process failed and
+// ErrParse-wrapped when it succeeded but the reply did not parse; only the
+// second case leaves a raw reply worth keeping.
 func Run(in Input, o Options) (Memo, string, error) {
 	bin := o.ClaudeBin
 	if bin == "" {
@@ -160,18 +174,34 @@ func Run(in Input, o Options) (Memo, string, error) {
 	// length limits and makes --dry-run output the exact same bytes.
 	cmd := exec.Command(bin, "-p", instructions, "--output-format", "text")
 	cmd.Dir = os.TempDir()
-	cmd.Env = runner.BaseEnv()
+	env := runner.BaseEnv()
+	// BaseEnv strips any inherited token on purpose, so an authenticated run
+	// needs the resolved one put back explicitly. It is never printed.
+	if o.Token != "" {
+		env = append(env, "CLAUDE_CODE_OAUTH_TOKEN="+o.Token)
+	}
+	cmd.Env = env
 	cmd.Stdin = strings.NewReader(in.Text())
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if o.Stderr != nil {
 		cmd.Stderr = o.Stderr
 	}
-	if err := cmd.Run(); err != nil {
-		return Memo{}, out.String(), fmt.Errorf("running %s -p: %w\n%s", bin, err, strings.TrimSpace(out.String()))
+	runErr := cmd.Run()
+	// A child that cannot authenticate says so on stdout and may still exit
+	// zero, so this is checked the same way the insights runner checks it.
+	if strings.Contains(out.String(), "Not logged in") {
+		return Memo{}, "", runner.ErrNotLoggedIn
+	}
+	if runErr != nil {
+		return Memo{}, "", fmt.Errorf("%w: running %s -p: %v\n%s",
+			ErrExec, bin, runErr, strings.TrimSpace(out.String()))
 	}
 	m, err := Parse(out.String())
-	return m, out.String(), err
+	if err != nil {
+		return Memo{}, out.String(), fmt.Errorf("%w: %v", ErrParse, err)
+	}
+	return m, out.String(), nil
 }
 
 var reObject = regexp.MustCompile(`(?s)\{.*\}`)

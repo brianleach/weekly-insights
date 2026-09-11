@@ -18,14 +18,17 @@ window and hands you the report it writes. Same sections, same format, one week.
 `CLAUDE_CONFIG_DIR`. So the tool builds a temporary config directory that contains
 only the window:
 
-- transcripts and per-session caches for the sessions in range
+- copies of the transcripts and per-session caches for the sessions in range
+  (the builtin skips symlinked transcripts when it lists the directory, so these
+  have to be real files)
 - symlinks to your real settings, plugins, commands and hooks, so the child behaves
   like your normal install
 - a copy of the account file, so the child is logged in as you
 
 then runs `claude -p /insights` against it, copies the report out, and deletes the
 stage. Nothing in the builtin is reimplemented; the report is whatever your installed
-Claude Code produces.
+Claude Code produces. Everything the stage copies is written with mode 0600 inside
+directories created 0700, and the whole stage is removed when the run ends.
 
 Two useful side effects. The child computes session metadata for every transcript
 it sees, and the tool harvests that back into your real cache, so sessions the
@@ -35,6 +38,8 @@ the stage, so the builtin's charts use a stable vocabulary and the run skips
 extraction entirely.
 
 ## Install
+
+Go 1.26 or newer is required (see `go.mod`).
 
 ```
 go install github.com/brianleach/weekly-insights/cmd/weekly-insights@latest
@@ -105,6 +110,7 @@ correction stuck. A second set of commands covers that:
 weekly-insights select    --days 7        # what is in the window, facet coverage
 weekly-insights prepare   --days 7 --out DIR
 weekly-insights aggregate --days 7        # save a snapshot
+weekly-insights progress  --weeks 4       # judge progression across recent reports
 weekly-insights report                    # newest snapshot vs the previous one
 weekly-insights report --trend            # every snapshot, one bar per week
 weekly-insights report --html --out DIR   # the same as browsable pages
@@ -119,8 +125,12 @@ model invents a label per session: on one real corpus "fix a bug" appeared as
 `test_and_ci_fixes`. You cannot chart that. `prompt` pins the vocabulary, `validate`
 enforces it, and `aggregate` normalizes anything already cached in a free-form one.
 
-The extraction step itself is left to you: `prepare` renders transcripts to text and
-`prompt` prints the instructions. Running it through Claude Code is the easy route,
+`progress` is the one command here that calls the model; see the network section
+below for exactly what it sends.
+
+The extraction step itself is left to you: `prepare` renders transcripts to text
+(0600 files in a 0700 directory; treat it as sensitive and delete it when you are
+done) and `prompt` prints the instructions. Running it through Claude Code is the easy route,
 and `skill/` holds a ready-made skill that fans it out to subagents. Snapshots record
 per-session rates (so a busy week is not penalised), the three friction types that
 generic extractors miss (`unverified_claim`, `unwanted_autonomous_action`,
@@ -130,17 +140,41 @@ generic extractors miss (`unverified_claim`, `unwanted_autonomous_action`,
 
 | Path | Owner | Used for |
 |---|---|---|
-| `~/.claude/projects/*/*.jsonl` | Claude Code | transcripts, linked into the stage |
+| `~/.claude/projects/*/*.jsonl` | Claude Code | transcripts, copied into the stage |
 | `~/.claude/usage-data/session-meta/` | Claude Code | per-session counters; harvested back, never overwritten |
 | `~/.claude/usage-data/facets/` | Claude Code | cached judgments; harvested back, never overwritten |
 | `~/.claude.json` | Claude Code | account file, copied into the stage |
+| `~/.claude/CLAUDE.md` | you | your global instructions; read by `progress` and **sent to the model** |
 | `~/.claude/usage-data/weekly-facets/` | this tool | canonical-vocabulary facets |
 | `~/.claude/usage-data/weekly/` | this tool | snapshots |
-| `~/claude-weekly-insights/` | this tool | reports |
+| `~/claude-weekly-insights/` | this tool | weekly reports and the `progress` memo |
 
-The `insights` command runs your installed Claude Code, which calls the model API as
-it would for a normal `/insights`. Every other command is local only and makes no
-network calls.
+Sensitive outputs are written with restrictive permissions: staged transcripts,
+prepared transcripts, reports, snapshots and the progress memo are files of mode
+0600 inside directories created 0700.
+
+### Network and what leaves your machine
+
+Two commands make network calls, both by running your installed Claude Code
+(`claude -p`) on your own subscription. Every other command is local only.
+
+**`insights`** runs the builtin `/insights` against the staged config directory.
+The child sends whatever the builtin sends for a normal `/insights` run: the
+session transcripts in the window (your prompts, assistant replies, file paths and
+project names) plus their cached metadata.
+
+**`progress`** sends, on stdin, in one prompt:
+
+- the extracted text of the last N weekly reports: at-a-glance summaries, project
+  areas, wins, friction categories and their verbatim examples, suggested
+  `CLAUDE.md` additions, suggested features, and horizon items
+- **your current global `~/.claude/CLAUDE.md`, in full, truncated only at 24000
+  characters.** If that file holds anything you do not want sent to the model, do
+  not run `progress`.
+- the numeric trend table, when snapshots exist
+
+Nothing else in the tool makes a network request, and the tool itself uploads
+nothing anywhere.
 
 ## Configuration
 

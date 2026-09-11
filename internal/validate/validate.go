@@ -11,6 +11,7 @@ package validate
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,13 @@ type Result struct {
 	Checked  int
 	Problems []Problem
 	Fixed    []string // files rewritten when fix was true
+	// Unresolved is what is still wrong after a fix pass, re-checked against
+	// what is now on disk. It is only populated when fix was true; a dry run
+	// reports everything through Problems. Callers exit non-zero when it is
+	// non-empty, because "--fix succeeded" and "the files are now valid" are
+	// different claims: unparseable JSON, a non-object file and a missing
+	// required field have no repair this tool can apply.
+	Unresolved []Problem
 }
 
 // required lists the fields an extraction must emit. A facet file missing any
@@ -103,6 +111,21 @@ func Dir(dir string, fix bool) (Result, error) {
 		if changed {
 			res.Fixed = append(res.Fixed, name)
 		}
+		if !fix {
+			continue
+		}
+		// Re-read the file as it now stands. Re-running the same checks is the
+		// only honest way to answer "is it valid now?": it covers both the
+		// files we rewrote and the ones we could not touch, and it cannot
+		// drift from the checks themselves the way a hand-kept list of
+		// "fixable problems" would.
+		remaining, _, err := checkFile(path, false)
+		if err != nil {
+			return Result{}, err
+		}
+		for _, m := range remaining {
+			res.Unresolved = append(res.Unresolved, Problem{File: name, Message: m})
+		}
 	}
 	return res, nil
 }
@@ -156,11 +179,11 @@ func checkFile(path string, fix bool) (problems []string, changed bool, err erro
 		out := map[string]float64{}
 		order := []string{}
 		for _, k := range sortedKeys(d) {
-			n, numeric := asNumber(d[k])
-			if !numeric {
-				// Dropped from the rewritten map: a non-numeric count cannot be
+			n, bad := asCount(d[k])
+			if bad != "" {
+				// Dropped from the rewritten map: an unusable count cannot be
 				// summed, and keeping it would re-trip this check forever.
-				problems = append(problems, fmt.Sprintf("%s.%s is not a number", cf.name, k))
+				problems = append(problems, fmt.Sprintf("%s.%s %s", cf.name, k, bad))
 				continue
 			}
 			c := k
@@ -211,20 +234,43 @@ func sortedKeys(m map[string]any) []string {
 	return ks
 }
 
-// asNumber accepts the shapes a JSON number can take here. Booleans and strings
-// are rejected even when they look numeric: "3" in a count field means the
-// extractor emitted the wrong type, which is worth reporting.
-func asNumber(v any) (float64, bool) {
-	switch n := v.(type) {
+// asCount accepts the shapes a valid count can take and rejects everything
+// else with a reason phrase, or "" when the value is good.
+//
+// Booleans and strings are rejected even when they look numeric: "3" in a
+// count field means the extractor emitted the wrong type. Fractions and
+// negatives are rejected because these maps are summed into map[string]int
+// downstream, where 1.5 fails to decode and -1 would silently cancel out a
+// real event. All three are dropped rather than coerced, the same treatment
+// non-numeric counts have always had: guessing at 1 or 2 for "1.5" invents a
+// number the extractor never wrote.
+func asCount(v any) (n float64, bad string) {
+	switch x := v.(type) {
 	case json.Number:
-		f, err := n.Float64()
-		return f, err == nil
+		f, err := x.Float64()
+		if err != nil {
+			return 0, "is not a number"
+		}
+		return checkCount(f)
 	case float64:
-		return n, true
+		return checkCount(x)
 	case int:
-		return float64(n), true
+		return checkCount(float64(x))
 	default:
-		return 0, false
+		return 0, "is not a number"
+	}
+}
+
+func checkCount(f float64) (float64, string) {
+	switch {
+	case math.IsNaN(f) || math.IsInf(f, 0):
+		return 0, "is not a number"
+	case f != math.Trunc(f):
+		return 0, fmt.Sprintf("is not a whole number (%v)", f)
+	case f < 0:
+		return 0, fmt.Sprintf("is negative (%v)", f)
+	default:
+		return f, ""
 	}
 }
 
@@ -235,8 +281,8 @@ func countsDiffer(orig map[string]any, out map[string]float64) bool {
 		return true
 	}
 	for k, v := range orig {
-		n, numeric := asNumber(v)
-		if !numeric {
+		n, bad := asCount(v)
+		if bad != "" {
 			return true
 		}
 		got, present := out[k]
@@ -268,7 +314,7 @@ func writeJSON(path string, v any) error {
 	if err := enc.Encode(v); err != nil {
 		return fmt.Errorf("encoding %s: %w", path, err)
 	}
-	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil

@@ -186,18 +186,52 @@ func Build(r window.Result, days int, collapses map[string]map[string]bool) Snap
 	return s
 }
 
-// Save writes a snapshot under its window label, which is also its identity.
+// defaultDays is the window length that keeps the unsuffixed filename. See
+// the Window doc comment for why.
+const defaultDays = 7
+
+// FileName is the on-disk name for a snapshot of the given window. A zero or
+// negative day count is treated as the default so a hand-built Snapshot with
+// no Days set still lands on the legacy name rather than "label-0d.json".
+func FileName(label string, days int) string {
+	if days <= 0 || days == defaultDays {
+		return label + ".json"
+	}
+	return fmt.Sprintf("%s-%dd.json", label, days)
+}
+
+// Save writes a snapshot under its label and window length.
 func Save(p store.Paths, s Snapshot) (string, error) {
-	path := filepath.Join(p.Snapshots(), s.Window.Label+".json")
+	path := filepath.Join(p.Snapshots(), FileName(s.Window.Label, s.Window.Days))
 	if err := store.WriteJSON(path, s); err != nil {
 		return "", fmt.Errorf("saving snapshot %s: %w", s.Window.Label, err)
 	}
 	return path, nil
 }
 
-// Load reads one snapshot by its window label.
+// LoadWindow reads the snapshot for one label and window length.
+func LoadWindow(p store.Paths, label string, days int) (Snapshot, error) {
+	return readSnapshot(filepath.Join(p.Snapshots(), FileName(label, days)))
+}
+
+// Load reads one snapshot by label, preferring the 7-day form and falling
+// back to whichever other window length is on disk for that date. Callers that
+// know the window they want should use LoadWindow; this exists so a label
+// typed on the command line still resolves when only a 30-day snapshot was
+// ever saved for it.
 func Load(p store.Paths, label string) (Snapshot, error) {
-	path := filepath.Join(p.Snapshots(), label+".json")
+	path := filepath.Join(p.Snapshots(), FileName(label, defaultDays))
+	if _, err := os.Stat(path); err != nil {
+		matches, gerr := filepath.Glob(filepath.Join(p.Snapshots(), label+"-*d.json"))
+		if gerr == nil && len(matches) > 0 {
+			sort.Strings(matches)
+			path = matches[0]
+		}
+	}
+	return readSnapshot(path)
+}
+
+func readSnapshot(path string) (Snapshot, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("reading snapshot %s: %w", path, err)
@@ -210,8 +244,12 @@ func Load(p store.Paths, label string) (Snapshot, error) {
 }
 
 // List returns every saved snapshot, oldest first, so callers can take the
-// last one as "previous" without re-sorting.
+// last one as "previous" without re-sorting. Snapshots of different window
+// lengths ending on the same date sort next to each other, shortest first.
 func List(p store.Paths) ([]Snapshot, error) {
+	// One glob covers both filename forms, "<label>.json" and
+	// "<label>-<days>d.json"; the window length is read back from the file
+	// rather than parsed out of the name.
 	matches, err := filepath.Glob(filepath.Join(p.Snapshots(), "*.json"))
 	if err != nil {
 		return nil, fmt.Errorf("globbing snapshots: %w", err)
@@ -229,7 +267,12 @@ func List(p store.Paths) ([]Snapshot, error) {
 		}
 		out = append(out, s)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Window.Label < out[j].Window.Label })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Window.Label != out[j].Window.Label {
+			return out[i].Window.Label < out[j].Window.Label
+		}
+		return out[i].Window.Days < out[j].Window.Days
+	})
 	return out, nil
 }
 

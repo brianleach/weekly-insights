@@ -12,6 +12,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -39,6 +40,15 @@ const (
 
 // keychainEnabled is a variable so tests can force the file path on macOS.
 var keychainEnabled = runtime.GOOS == "darwin"
+
+// runSecurity runs the macOS `security` CLI. It is a variable so tests can
+// exercise the keychain paths without touching the developer's real keychain.
+var runSecurity = func(args ...string) ([]byte, error) {
+	return exec.Command("security", args...).CombinedOutput()
+}
+
+// keychainNotFoundExit is the exit status `security` uses for a missing item.
+const keychainNotFoundExit = 44
 
 // Path is the fallback token file: ~/Library/Application Support on macOS,
 // $XDG_CONFIG_HOME or ~/.config on Linux, %AppData% on Windows.
@@ -107,19 +117,103 @@ func Store(token string) (Source, error) {
 }
 
 // Clear removes any stored token from keychain and file. The environment is
-// the caller's to manage.
+// the caller's to manage. A missing item is not a failure, but any other
+// keychain or filesystem error is reported rather than swallowed, so that
+// `auth --clear` cannot claim success while a token is still stored.
 func Clear() error {
 	var errs []error
 	if keychainEnabled {
-		// A missing item is not an error for a clear.
-		_ = exec.Command("security", "delete-generic-password", "-s", KeychainService).Run()
-	}
-	if p, err := Path(); err == nil {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, err)
+		if out, err := runSecurity("delete-generic-password", "-s", KeychainService); err != nil && !isKeychainNotFound(err, out) {
+			errs = append(errs, fmt.Errorf("security delete-generic-password: %w: %s", err, strings.TrimSpace(string(out))))
 		}
 	}
+	p, err := Path()
+	if err != nil {
+		errs = append(errs, err)
+	} else if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, fmt.Errorf("removing %s: %w", p, err))
+	}
 	return errors.Join(errs...)
+}
+
+// isKeychainNotFound reports whether a `security` failure just means the item
+// was already absent. macOS exits 44 and prints "The specified item could not
+// be found in the keychain."; both are checked because the exit status is not
+// documented as stable.
+func isKeychainNotFound(err error, out []byte) bool {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == keychainNotFoundExit {
+		return true
+	}
+	if strings.Contains(string(out), "could not be found") {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "could not be found")
+}
+
+// PromptToken asks the operator for a token on out and reads one line from in.
+// When isTerminal is true on a non-Windows platform the terminal echo is
+// disabled for the duration of the read, so the token never appears on screen.
+// The token is never included in a returned error.
+func PromptToken(in io.Reader, out io.Writer, isTerminal bool) (string, error) {
+	fmt.Fprintln(out, `Run "claude setup-token" in another terminal, then paste the token it prints.`)
+
+	echoOff := false
+	if isTerminal && runtime.GOOS != "windows" {
+		if err := setEcho(false); err != nil {
+			fmt.Fprintln(out, "Could not disable terminal echo; the token will be visible as you type.")
+		} else {
+			echoOff = true
+			defer func() {
+				_ = setEcho(true)
+			}()
+		}
+	}
+
+	fmt.Fprint(out, "Token: ")
+	line, err := readLine(in)
+	if echoOff {
+		// The Return keypress was not echoed, so move the cursor down.
+		fmt.Fprintln(out)
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading token: %w", err)
+	}
+	return strings.TrimSpace(line), nil
+}
+
+// setEcho toggles terminal echo with stty, which needs the real terminal on
+// its stdin rather than whatever reader the caller passed.
+func setEcho(on bool) error {
+	arg := "-echo"
+	if on {
+		arg = "echo"
+	}
+	cmd := exec.Command("stty", arg)
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+// readLine reads a single line one byte at a time, so a caller sharing the
+// reader (a piped stdin, say) keeps whatever follows the token.
+func readLine(in io.Reader) (string, error) {
+	var b strings.Builder
+	buf := make([]byte, 1)
+	for {
+		n, err := in.Read(buf)
+		if n > 0 {
+			if buf[0] == '\n' {
+				return b.String(), nil
+			}
+			b.WriteByte(buf[0])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && b.Len() > 0 {
+				return b.String(), nil
+			}
+			return "", err
+		}
+	}
 }
 
 func validate(token string) error {
@@ -135,22 +229,29 @@ func validate(token string) error {
 }
 
 func fromKeychain() string {
-	out, err := exec.Command("security", "find-generic-password", "-s", KeychainService, "-w").Output()
+	out, err := runSecurity("find-generic-password", "-s", KeychainService, "-w")
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
 }
 
+// toKeychain writes the token to the login keychain.
+//
+// The token passes through argv because the `security` CLI offers no stdin
+// mode for -w: it is briefly visible to anything listing local processes while
+// the command runs. That is the same exposure as running the documented
+// `security add-generic-password ... -w <token>` by hand, and it is confined to
+// this machine and this user's own processes. Users who object can store the
+// token in the fallback file instead, which never puts it on a command line.
 func toKeychain(token string) error {
 	acct := "weekly-insights"
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		acct = u.Username
 	}
-	// -U updates an existing item instead of failing on it. The token travels
-	// in argv, the same way the `security` manual page has users enter it.
-	cmd := exec.Command("security", "add-generic-password", "-a", acct, "-s", KeychainService, "-w", token, "-U")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	// -U updates an existing item instead of failing on it.
+	out, err := runSecurity("add-generic-password", "-a", acct, "-s", KeychainService, "-w", token, "-U")
+	if err != nil {
 		return fmt.Errorf("security add-generic-password: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

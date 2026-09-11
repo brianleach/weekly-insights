@@ -64,8 +64,10 @@ func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
 	}
 
 	sp := store.Paths{Root: filepath.Join(dst, "usage-data"), ClaudeHome: dst}
+	// 0700/0600 throughout the stage: it holds copies of raw transcripts, which
+	// carry prompts and project names, so nothing is group- or world-readable.
 	for _, d := range []string{sp.Transcripts(), sp.SessionMeta(), sp.BuiltinFacets()} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+		if err := os.MkdirAll(d, 0o700); err != nil {
 			return c, fmt.Errorf("creating %s: %w", d, err)
 		}
 	}
@@ -77,7 +79,7 @@ func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
 			return c, err
 		}
 		src := filepath.Join(in.Paths.SessionMeta(), id+".json")
-		if err := copyFile(src, filepath.Join(sp.SessionMeta(), id+".json"), 0o644); err == nil {
+		if err := copyFile(src, filepath.Join(sp.SessionMeta(), id+".json"), 0o600); err == nil {
 			c.Meta++
 		} else if !os.IsNotExist(err) {
 			return c, fmt.Errorf("staging session meta for %s: %w", id, err)
@@ -86,7 +88,7 @@ func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
 		// the cache also means the child skips extraction entirely, so the
 		// run costs only the narrative passes.
 		for _, dir := range []string{in.Paths.WeeklyFacets(), in.Paths.BuiltinFacets()} {
-			err := copyFile(filepath.Join(dir, id+".json"), filepath.Join(sp.BuiltinFacets(), id+".json"), 0o644)
+			err := copyFile(filepath.Join(dir, id+".json"), filepath.Join(sp.BuiltinFacets(), id+".json"), 0o600)
 			if err == nil {
 				c.Facets++
 				break
@@ -112,10 +114,10 @@ func stageTranscript(real, sp store.Paths, id string, c *Counts) error {
 		return nil
 	}
 	projDir := filepath.Join(sp.Transcripts(), filepath.Base(filepath.Dir(tp)))
-	if err := os.MkdirAll(projDir, 0o755); err != nil {
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
 		return fmt.Errorf("creating %s: %w", projDir, err)
 	}
-	if err := copyFile(tp, filepath.Join(projDir, id+".jsonl"), 0o644); err != nil {
+	if err := copyFile(tp, filepath.Join(projDir, id+".jsonl"), 0o600); err != nil {
 		return fmt.Errorf("copying transcript %s: %w", id, err)
 	}
 	c.Transcripts++
@@ -137,12 +139,12 @@ func copyDir(src, dst string) error {
 		rel, _ := filepath.Rel(src, path)
 		target := filepath.Join(dst, rel)
 		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			return os.MkdirAll(target, 0o700)
 		}
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		return copyFile(path, target, 0o644)
+		return copyFile(path, target, 0o600)
 	})
 }
 
@@ -186,6 +188,13 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
+		return err
+	}
+	// The open mode is masked by the process umask, and a destination that
+	// somehow already existed would keep its old mode, so the mode is set
+	// explicitly rather than left to the create.
+	if err := out.Chmod(mode); err != nil {
+		out.Close()
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {

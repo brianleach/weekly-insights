@@ -439,3 +439,182 @@ func TestProblemsAreAttributedToTheirFile(t *testing.T) {
 		t.Errorf("File = %q, want sess-a.json", res.Problems[0].File)
 	}
 }
+
+func unresolved(res Result) string {
+	var sb strings.Builder
+	for _, p := range res.Unresolved {
+		sb.WriteString(p.File + ": " + p.Message + "\n")
+	}
+	return sb.String()
+}
+
+func hasUnresolved(res Result, substr string) bool {
+	for _, p := range res.Unresolved {
+		if strings.Contains(p.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUnresolvedReportsWhatFixCouldNotRepair(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sess-broken.json"), []byte(`{"session_id": "sess-broken", `), 0o644); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+	missing := clean("sess-missing")
+	delete(missing, "brief_summary")
+	writeFacet(t, dir, "sess-missing", missing)
+	notObj := clean("sess-notobj")
+	notObj["goal_categories"] = []any{"fix_bug"}
+	writeFacet(t, dir, "sess-notobj", notObj)
+
+	res, err := Dir(dir, true)
+	if err != nil {
+		t.Fatalf("Dir(fix): %v", err)
+	}
+	if !hasUnresolved(res, "unparseable JSON") {
+		t.Errorf("malformed file should stay unresolved, got:\n%s", unresolved(res))
+	}
+	if !hasUnresolved(res, "missing field: brief_summary") {
+		t.Errorf("missing field should stay unresolved, got:\n%s", unresolved(res))
+	}
+	if !hasUnresolved(res, "goal_categories is not an object") {
+		t.Errorf("non-object count field should stay unresolved, got:\n%s", unresolved(res))
+	}
+	for _, p := range res.Unresolved {
+		if p.File == "" {
+			t.Errorf("unresolved problem not attributed to a file: %+v", p)
+		}
+	}
+}
+
+func TestUnresolvedIsEmptyWhenFixRepairsEverything(t *testing.T) {
+	f := clean("sess-fixable")
+	f["goal_categories"] = map[string]any{"bug_fixing": 3}
+	f["friction_counts"] = map[string]any{"stale_context": 1}
+	dir, _ := dirWith(t, "sess-fixable", f)
+
+	res, err := Dir(dir, true)
+	if err != nil {
+		t.Fatalf("Dir(fix): %v", err)
+	}
+	if len(res.Problems) == 0 {
+		t.Fatal("want off-vocabulary problems on the fix pass")
+	}
+	if len(res.Unresolved) != 0 {
+		t.Errorf("everything was repairable, want no unresolved, got:\n%s", unresolved(res))
+	}
+
+	second, err := Dir(dir, false)
+	if err != nil {
+		t.Fatalf("Dir second run: %v", err)
+	}
+	if len(second.Problems) != 0 {
+		t.Errorf("second run should be clean, got:\n%s", messages(second))
+	}
+}
+
+func TestUnresolvedIsEmptyOnADryRun(t *testing.T) {
+	f := clean("sess-dry")
+	delete(f, "brief_summary")
+	dir, _ := dirWith(t, "sess-dry", f)
+
+	res, err := Dir(dir, false)
+	if err != nil {
+		t.Fatalf("Dir: %v", err)
+	}
+	if len(res.Problems) == 0 {
+		t.Fatal("want the missing field reported through Problems")
+	}
+	if len(res.Unresolved) != 0 {
+		t.Errorf("a dry run reports through Problems only, got:\n%s", unresolved(res))
+	}
+}
+
+func TestFractionalCountIsReportedAndDropped(t *testing.T) {
+	f := clean("sess-frac")
+	f["goal_categories"] = map[string]any{"fix_bug": 1.5}
+	dir, path := dirWith(t, "sess-frac", f)
+
+	res, err := Dir(dir, false)
+	if err != nil {
+		t.Fatalf("Dir: %v", err)
+	}
+	if !hasProblem(res, "goal_categories.fix_bug is not a whole number (1.5)") {
+		t.Errorf("want a fractional-count problem, got:\n%s", messages(res))
+	}
+
+	res, err = Dir(dir, true)
+	if err != nil {
+		t.Fatalf("Dir(fix): %v", err)
+	}
+	if got := readFacet(t, path)["goal_categories"].(map[string]any); len(got) != 0 {
+		t.Errorf("goal_categories = %v, want the fractional entry dropped", got)
+	}
+	if len(res.Unresolved) != 0 {
+		t.Errorf("dropping the entry resolves it, got:\n%s", unresolved(res))
+	}
+}
+
+func TestNegativeCountIsReportedAndDropped(t *testing.T) {
+	f := clean("sess-neg")
+	f["friction_counts"] = map[string]any{"tool_failed": -1}
+	dir, path := dirWith(t, "sess-neg", f)
+
+	res, err := Dir(dir, false)
+	if err != nil {
+		t.Fatalf("Dir: %v", err)
+	}
+	if !hasProblem(res, "friction_counts.tool_failed is negative (-1)") {
+		t.Errorf("want a negative-count problem, got:\n%s", messages(res))
+	}
+
+	if _, err := Dir(dir, true); err != nil {
+		t.Fatalf("Dir(fix): %v", err)
+	}
+	if got := readFacet(t, path)["friction_counts"].(map[string]any); len(got) != 0 {
+		t.Errorf("friction_counts = %v, want the negative entry dropped", got)
+	}
+}
+
+func TestStringCountIsReportedEvenWhenItLooksNumeric(t *testing.T) {
+	f := clean("sess-strcount")
+	f["goal_categories"] = map[string]any{"fix_bug": "3"}
+	dir, path := dirWith(t, "sess-strcount", f)
+
+	res, err := Dir(dir, false)
+	if err != nil {
+		t.Fatalf("Dir: %v", err)
+	}
+	if !hasProblem(res, "goal_categories.fix_bug is not a number") {
+		t.Errorf("want a type problem for a quoted count, got:\n%s", messages(res))
+	}
+
+	if _, err := Dir(dir, true); err != nil {
+		t.Fatalf("Dir(fix): %v", err)
+	}
+	if got := readFacet(t, path)["goal_categories"].(map[string]any); len(got) != 0 {
+		t.Errorf("goal_categories = %v, want the quoted count dropped", got)
+	}
+}
+
+func TestWholeNumberCountIsAccepted(t *testing.T) {
+	f := clean("sess-int")
+	f["goal_categories"] = map[string]any{"fix_bug": 3}
+	dir, path := dirWith(t, "sess-int", f)
+
+	res, err := Dir(dir, true)
+	if err != nil {
+		t.Fatalf("Dir(fix): %v", err)
+	}
+	if len(res.Problems) != 0 {
+		t.Errorf("3 is a valid count, got:\n%s", messages(res))
+	}
+	if len(res.Fixed) != 0 {
+		t.Errorf("a valid count must not trigger a rewrite, Fixed = %v", res.Fixed)
+	}
+	if got := readFacet(t, path)["goal_categories"].(map[string]any)["fix_bug"]; got != float64(3) {
+		t.Errorf("fix_bug = %v, want 3", got)
+	}
+}

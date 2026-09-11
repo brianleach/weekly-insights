@@ -30,8 +30,16 @@ type Snapshot struct {
 	Rates               map[string]float64 `json:"rates"`
 }
 
-// Window is the time range covered. Label is the end date and doubles as the
-// snapshot's filename and identity.
+// Window is the time range covered. Label is the end date, and together with
+// Days it forms the snapshot's identity.
+//
+// Filenames follow that identity: a 7-day snapshot is "<label>.json" and any
+// other window length is "<label>-<days>d.json", for example
+// "2020-03-08-30d.json". The 7-day case keeps the bare form because snapshots
+// written before windows were nameable are already on disk under it, and a
+// trend line that silently drops its own history is worse than an awkward
+// naming rule. Without the suffix a 7-day and a 30-day run ending on the same
+// date would collide and the second would overwrite the first.
 type Window struct {
 	Start string `json:"start"`
 	End   string `json:"end"`

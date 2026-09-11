@@ -11,7 +11,7 @@
 package main
 
 import (
-	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -190,6 +190,9 @@ func cmdInsights(args []string) error {
 	fmt.Fprintf(os.Stderr, "staged %d sessions (%d transcripts, %d meta, %d facets) for %s .. %s\n",
 		counts.Sessions, counts.Transcripts, counts.Meta, counts.Facets,
 		r.Start.Format("2006-01-02"), r.End.Format("2006-01-02"))
+	if r.Derived > 0 {
+		fmt.Fprintf(os.Stderr, "%d session(s) had no cached metadata; derived from transcripts\n", r.Derived)
+	}
 	if *keep {
 		fmt.Fprintf(os.Stderr, "stage kept at %s\n", st)
 	}
@@ -217,6 +220,11 @@ child needs a long-lived token minted on your subscription. One-time setup:
 	}
 	fmt.Fprintf(os.Stderr, "harvested %d session-meta and %d facet files into the real cache\n",
 		res.HarvestedMeta, res.HarvestedFacets)
+	if res.HarvestErrors > 0 {
+		// The report is still good; only the cache refresh was partial.
+		fmt.Fprintf(os.Stderr, "warning: %d cache files could not be copied into the real cache\n",
+			res.HarvestErrors)
+	}
 	fmt.Println(res.Report)
 	if *openIt {
 		openPath(res.Report)
@@ -236,6 +244,11 @@ func cmdProgress(args []string) error {
 	openIt := fs.Bool("open", false, "open the memo when done")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// Below two there is no progression to judge, and the slice below would
+	// take a suffix of a negative length.
+	if *weeks < 2 {
+		return fmt.Errorf("--weeks must be at least 2 to compare weekly reports; got %d", *weeks)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -289,17 +302,22 @@ func cmdProgress(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "comparing %d weekly reports (%s .. %s) with the default model ...\n",
 		len(in.Weeks), in.Weeks[0].Label, in.Weeks[len(in.Weeks)-1].Label)
-	memo, raw, err := progress.Run(in, progress.Options{ClaudeBin: *claudeBin, Stderr: os.Stderr})
-	if err != nil && raw == "" {
-		return err
-	}
-	if err != nil {
-		// A reply that did not parse is still worth keeping; the page shows it verbatim.
+	token, _ := auth.Resolve()
+	memo, raw, err := progress.Run(in, progress.Options{ClaudeBin: *claudeBin, Token: token, Stderr: os.Stderr})
+	switch {
+	case errors.Is(err, progress.ErrParse):
+		// The process succeeded, so its reply is still the model's answer; the
+		// page shows it verbatim rather than losing it.
 		fmt.Fprintf(os.Stderr, "warning: %v; writing the raw reply instead\n", err)
+	case err != nil:
+		// Anything else, including a failed child, is a failed command.
+		return err
 	}
 	last := in.Weeks[len(in.Weeks)-1]
 	out := filepath.Join(*reportsDir, fmt.Sprintf("progress-%dd-%s.html", last.Days, last.Label))
-	if err := os.WriteFile(out, []byte(progress.Render(memo, raw, in)), 0o644); err != nil {
+	// The memo quotes the weekly reports, so it gets the same owner-only
+	// treatment they do.
+	if err := writeSensitive(out, []byte(progress.Render(memo, raw, in))); err != nil {
 		return fmt.Errorf("writing memo: %w", err)
 	}
 	fmt.Println(out)
@@ -333,10 +351,13 @@ func cmdAuth(args []string) error {
 		return fmt.Errorf("no token found; run \"weekly-insights auth\"")
 	}
 
-	fmt.Fprintln(os.Stderr, "Run \"claude setup-token\" in another terminal, then paste the token it prints.")
-	fmt.Fprintln(os.Stderr, "(input is not hidden; clear your terminal afterwards if that matters)")
-	fmt.Fprint(os.Stderr, "Token: ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	// Echo is only suppressible on a terminal, so the prompt needs to know
+	// whether stdin is one or a pipe.
+	isTerminal := false
+	if fi, err := os.Stdin.Stat(); err == nil {
+		isTerminal = fi.Mode()&os.ModeCharDevice != 0
+	}
+	line, err := auth.PromptToken(os.Stdin, os.Stderr, isTerminal)
 	if err != nil && line == "" {
 		return fmt.Errorf("reading token: %w", err)
 	}
@@ -352,6 +373,21 @@ func cmdAuth(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "token stored (%s)\n", where)
 	return nil
+}
+
+// writeSensitive writes a page this tool generates from the user's own
+// sessions. Those pages quote prompts and project names, so the directory is
+// created owner-only and the file is owner read/write, including when it
+// replaces one left behind with looser permissions.
+func writeSensitive(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("creating %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return err
+	}
+	// WriteFile applies its mode only when it creates the file.
+	return os.Chmod(path, 0o600)
 }
 
 // openPath opens a file with the platform's default handler. Failures are
@@ -435,6 +471,9 @@ func cmdSelect(args []string) error {
 		bySource[store.SourceCanonical], bySource[store.SourceBuiltin],
 		len(r.Substantive)-withFacets)
 	fmt.Printf("to extract   : %d\n", len(need))
+	if r.Derived > 0 {
+		fmt.Printf("derived meta : %d session(s) had no cached record; metadata was read from the transcript\n", r.Derived)
+	}
 
 	proj := map[string]int{}
 	for _, s := range r.Substantive {
@@ -468,7 +507,9 @@ func cmdPrepare(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(*out, 0o755); err != nil {
+	// Rendered transcripts are the rawest form of the session data this tool
+	// touches, so the directory holding them is owner-only.
+	if err := os.MkdirAll(*out, 0o700); err != nil {
 		return fmt.Errorf("creating %s: %w", *out, err)
 	}
 	n := 0
@@ -586,7 +627,8 @@ func cmdReport(args []string) error {
 		if !*asHTML {
 			return fmt.Errorf("--out requires --html")
 		}
-		if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		// These pages quote the same session data the weekly reports do.
+		if err := os.MkdirAll(*outDir, 0o700); err != nil {
 			return fmt.Errorf("creating %s: %w", *outDir, err)
 		}
 		for i := range snaps {
@@ -597,13 +639,13 @@ func cmdReport(args []string) error {
 			label := snaps[i].Window.Label
 			path := filepath.Join(*outDir, "week-"+label+".html")
 			page := report.WeeklyHTML(snaps[i], prev)
-			if err := os.WriteFile(path, []byte(page), 0o644); err != nil {
+			if err := writeSensitive(path, []byte(page)); err != nil {
 				return fmt.Errorf("writing %s: %w", path, err)
 			}
 			fmt.Println(path)
 		}
 		tp := filepath.Join(*outDir, "trend.html")
-		if err := os.WriteFile(tp, []byte(report.TrendHTML(snaps)), 0o644); err != nil {
+		if err := writeSensitive(tp, []byte(report.TrendHTML(snaps))); err != nil {
 			return fmt.Errorf("writing %s: %w", tp, err)
 		}
 		fmt.Println(tp)
@@ -711,6 +753,15 @@ func cmdValidate(args []string) error {
 	// Unfixed problems are an error so a pipeline stops before aggregating a
 	// window whose labels would not be comparable.
 	if len(order) > 0 && !*fix {
+		os.Exit(1)
+	}
+	// --fix is not a guarantee: anything it could not normalize is still an
+	// off-vocabulary label, and exiting zero here would hide that.
+	if len(res.Unresolved) > 0 {
+		fmt.Printf("\n%d problems remain after --fix:\n", len(res.Unresolved))
+		for _, pr := range res.Unresolved {
+			fmt.Printf("  %s: %s\n", filepath.Base(pr.File), pr.Message)
+		}
 		os.Exit(1)
 	}
 	return nil

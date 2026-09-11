@@ -72,6 +72,87 @@ echo "Your shareable insights report is ready"
 	if _, err := os.Stat(filepath.Join(real.SessionMeta(), "new.json")); err != nil {
 		t.Error("new session-meta was not harvested into the real cache")
 	}
+	if r.HarvestErrors != 0 {
+		t.Errorf("HarvestErrors = %d, want 0", r.HarvestErrors)
+	}
+	// The report quotes prompts and project names, so neither it nor the
+	// directory holding it may be readable by anyone else.
+	fi, err := os.Stat(r.Report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("report mode = %o, want 600", fi.Mode().Perm())
+	}
+	di, err := os.Stat(filepath.Dir(r.Report))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di.Mode().Perm() != 0o700 {
+		t.Errorf("report directory mode = %o, want 700", di.Mode().Perm())
+	}
+}
+
+// Overwriting a report left behind with looser permissions must tighten it,
+// not inherit the old mode.
+func TestRunTightensAnExistingReport(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "insights.html")
+	if err := os.WriteFile(out, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := fakeClaude(t, `
+mkdir -p "$CLAUDE_CONFIG_DIR/usage-data"
+echo '<html>fresh</html>' > "$CLAUDE_CONFIG_DIR/usage-data/report-2026-09-11-120000.html"
+`)
+	r, err := Run(Options{Real: realPaths(t), Stage: t.TempDir(), ClaudeBin: bin, OutPath: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(r.Report)
+	if !strings.Contains(string(b), "fresh") {
+		t.Errorf("report not overwritten, got %q", b)
+	}
+	fi, _ := os.Stat(out)
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("existing report kept mode %o; want it tightened to 600", fi.Mode().Perm())
+	}
+}
+
+func TestHarvestSkipsExistingAndCountsFailures(t *testing.T) {
+	from, to := t.TempDir(), t.TempDir()
+	for _, n := range []string{"a.json", "b.json"} {
+		if err := os.WriteFile(filepath.Join(from, n), []byte(`{"v":"stage"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(to, "a.json"), []byte(`{"v":"real"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	copied, failed := harvest(from, to)
+	if copied != 1 || failed != 0 {
+		t.Errorf("harvest = %d copied, %d failed; want 1 and 0", copied, failed)
+	}
+	b, _ := os.ReadFile(filepath.Join(to, "a.json"))
+	if string(b) != `{"v":"real"}` {
+		t.Error("an existing file was overwritten")
+	}
+	fi, err := os.Stat(filepath.Join(to, "b.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("harvested file mode = %o, want 600", fi.Mode().Perm())
+	}
+
+	// A destination that cannot be written to is a counted failure, not a
+	// silent one and not a copy.
+	blocked := filepath.Join(t.TempDir(), "nope")
+	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if copied, failed = harvest(from, filepath.Join(blocked, "sub")); copied != 0 || failed != 2 {
+		t.Errorf("harvest into an unusable directory = %d copied, %d failed; want 0 and 2", copied, failed)
+	}
 }
 
 func TestRunReportsNotLoggedIn(t *testing.T) {

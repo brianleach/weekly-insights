@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -355,5 +356,168 @@ func TestSaveLoadListRoundTrip(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].Window.Label != "2020-03-01" || list[1].Window.Label != "2020-03-08" {
 		t.Errorf("list not sorted ascending: %+v", list)
+	}
+}
+
+// buildFor makes a minimal snapshot for a given label and window length, so
+// the filename tests are not entangled with aggregation behaviour.
+func buildFor(label string, days int, messages int) Snapshot {
+	s := Build(testWindow([]model.Session{
+		{Meta: model.SessionMeta{SessionID: "s1", ProjectPath: "/w/a", StartTime: "2020-03-02T09:00:00Z", UserMessageCount: messages}},
+	}), days, nil)
+	s.Window.Label = label
+	return s
+}
+
+func TestSaveSeparatesWindowLengthsEndingOnTheSameDate(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+
+	weekly, err := Save(p, buildFor("2020-03-08", 7, 7))
+	if err != nil {
+		t.Fatalf("Save 7d: %v", err)
+	}
+	monthly, err := Save(p, buildFor("2020-03-08", 30, 30))
+	if err != nil {
+		t.Fatalf("Save 30d: %v", err)
+	}
+
+	if want := filepath.Join(p.Snapshots(), "2020-03-08.json"); weekly != want {
+		t.Errorf("7-day path = %q, want %q (the legacy unsuffixed name)", weekly, want)
+	}
+	if want := filepath.Join(p.Snapshots(), "2020-03-08-30d.json"); monthly != want {
+		t.Errorf("30-day path = %q, want %q", monthly, want)
+	}
+
+	entries, err := filepath.Glob(filepath.Join(p.Snapshots(), "*.json"))
+	if err != nil {
+		t.Fatalf("globbing: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 files on disk, got %v", entries)
+	}
+
+	// Neither overwrote the other.
+	got, err := LoadWindow(p, "2020-03-08", 7)
+	if err != nil {
+		t.Fatalf("LoadWindow 7d: %v", err)
+	}
+	if got.Window.Days != 7 || got.Volume.Messages != 7 {
+		t.Errorf("7-day snapshot = %+v", got.Window)
+	}
+	got, err = LoadWindow(p, "2020-03-08", 30)
+	if err != nil {
+		t.Fatalf("LoadWindow 30d: %v", err)
+	}
+	if got.Window.Days != 30 || got.Volume.Messages != 30 {
+		t.Errorf("30-day snapshot = %+v", got.Window)
+	}
+}
+
+func TestListReturnsEveryWindowLengthOrderedByLabelThenDays(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	for _, s := range []Snapshot{
+		buildFor("2020-03-08", 30, 30),
+		buildFor("2020-03-08", 7, 7),
+		buildFor("2020-03-01", 7, 1),
+	} {
+		if _, err := Save(p, s); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	}
+
+	list, err := List(p)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("want 3 snapshots, got %d", len(list))
+	}
+	type key struct {
+		label string
+		days  int
+	}
+	want := []key{{"2020-03-01", 7}, {"2020-03-08", 7}, {"2020-03-08", 30}}
+	for i, w := range want {
+		if list[i].Window.Label != w.label || list[i].Window.Days != w.days {
+			t.Errorf("list[%d] = %s/%dd, want %s/%dd", i, list[i].Window.Label, list[i].Window.Days, w.label, w.days)
+		}
+	}
+}
+
+func TestLoadFallsBackToAnotherWindowLength(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	if _, err := Save(p, buildFor("2020-03-08", 30, 30)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := Load(p, "2020-03-08")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Window.Days != 30 {
+		t.Errorf("days = %d, want the 30-day snapshot", got.Window.Days)
+	}
+
+	// The 7-day form wins once it exists.
+	if _, err := Save(p, buildFor("2020-03-08", 7, 7)); err != nil {
+		t.Fatalf("Save 7d: %v", err)
+	}
+	got, err = Load(p, "2020-03-08")
+	if err != nil {
+		t.Fatalf("Load after 7d save: %v", err)
+	}
+	if got.Window.Days != 7 {
+		t.Errorf("days = %d, want the 7-day snapshot to take precedence", got.Window.Days)
+	}
+	if _, err := Load(p, "1999-01-01"); err == nil {
+		t.Error("Load of a missing label should error")
+	}
+}
+
+func TestFileNameScheme(t *testing.T) {
+	for _, c := range []struct {
+		days int
+		want string
+	}{{7, "2020-03-08.json"}, {0, "2020-03-08.json"}, {-1, "2020-03-08.json"}, {30, "2020-03-08-30d.json"}, {1, "2020-03-08-1d.json"}} {
+		if got := FileName("2020-03-08", c.days); got != c.want {
+			t.Errorf("FileName(%d) = %q, want %q", c.days, got, c.want)
+		}
+	}
+}
+
+func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	path, err := Save(p, buildFor("2020-03-08", 7, 1))
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("snapshot mode = %v, want 0600; snapshots hold verbatim corrections", fi.Mode().Perm())
+	}
+	di, err := os.Stat(p.Snapshots())
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if di.Mode().Perm() != 0o700 {
+		t.Errorf("snapshot dir mode = %v, want 0700", di.Mode().Perm())
+	}
+
+	// A file left behind by an older version is tightened on overwrite.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := Save(p, buildFor("2020-03-08", 7, 2)); err != nil {
+		t.Fatalf("Save again: %v", err)
+	}
+	fi, err = os.Stat(path)
+	if err != nil {
+		t.Fatalf("re-stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode after overwrite = %v, want 0600", fi.Mode().Perm())
 	}
 }

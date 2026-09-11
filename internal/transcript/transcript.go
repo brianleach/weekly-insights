@@ -19,7 +19,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/brianleach/weekly-insights/internal/model"
 	"github.com/brianleach/weekly-insights/internal/store"
 )
 
@@ -58,6 +60,10 @@ func (o Options) withDefaults() Options {
 // are decoded; message.content is held raw because it is polymorphic.
 type entry struct {
 	Type string `json:"type"`
+	// Cwd and Timestamp are written by the CLI on every entry. Summarize reads
+	// them; rendering ignores them.
+	Cwd       string `json:"cwd"`
+	Timestamp string `json:"timestamp"`
 	// isCompactSummary has appeared on both the envelope and the message
 	// depending on the writer's version, so both are read.
 	IsCompactSummary bool `json:"isCompactSummary"`
@@ -251,13 +257,116 @@ func WriteFor(p store.Paths, sessionID, projectPath, start, dir string, o Option
 	if body == "" {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700/0600 throughout: a rendered transcript carries the user's prompts and
+	// project paths, so nothing here is group- or world-readable.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating transcript directory %s: %w", dir, err)
 	}
 	header := fmt.Sprintf("Session: %s\nDate: %s\nProject: %s\n\n", sessionID, start, projectPath)
 	out := filepath.Join(dir, sessionID+".txt")
-	if err := os.WriteFile(out, []byte(header+body), 0o644); err != nil {
+	// WriteFile keeps the mode of a file that already exists, so a destination
+	// left over from an earlier, looser run is tightened before it is rewritten.
+	if err := os.Chmod(out, 0o600); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("tightening %s: %w", out, err)
+	}
+	if err := os.WriteFile(out, []byte(header+body), 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", out, err)
 	}
 	return nil
+}
+
+// Summarize derives the minimal session metadata selection needs directly from
+// a transcript. It exists because the builtin's session-meta cache is only
+// written when /insights runs, and is capped per run: a session with a
+// transcript but no cached record would otherwise be invisible to every report.
+//
+// Only the fields that selection reads are filled in. The counters the builtin
+// derives from tool payloads (tokens, diffs, tool errors) are left zero rather
+// than half-guessed, so a derived record is never mistaken for a complete one.
+func Summarize(path string) (model.SessionMeta, error) {
+	m := model.SessionMeta{
+		SessionID: strings.TrimSuffix(filepath.Base(path), ".jsonl"),
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return model.SessionMeta{}, fmt.Errorf("opening transcript %s: %w", path, err)
+	}
+	defer f.Close()
+
+	var first, last time.Time
+	// Same reader as Render: transcript lines routinely exceed bufio.Scanner's
+	// 64KB token limit, so ReadString is the only safe line source here.
+	r := bufio.NewReader(f)
+	for {
+		raw, rerr := r.ReadString('\n')
+		if raw != "" {
+			summarizeLine(raw, &m, &first, &last)
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return model.SessionMeta{}, fmt.Errorf("reading transcript %s: %w", path, rerr)
+		}
+	}
+	if !first.IsZero() && !last.IsZero() {
+		m.DurationMinutes = last.Sub(first).Minutes()
+	}
+	return m, nil
+}
+
+// summarizeLine folds one JSON line into the summary. Blank and unparseable
+// lines are ignored for the same reason renderLine ignores them: the file is
+// appended to while the session runs, so its tail is routinely half-written.
+func summarizeLine(raw string, m *model.SessionMeta, first, last *time.Time) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	var e entry
+	if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		return
+	}
+	if m.ProjectPath == "" && e.Cwd != "" {
+		m.ProjectPath = e.Cwd
+	}
+	if ts, ok := parseTime(e.Timestamp); ok {
+		// Entries are usually in order but nothing guarantees it, so the window
+		// bounds are taken as a min and a max rather than as the first and last
+		// lines of the file.
+		if first.IsZero() || ts.Before(*first) {
+			*first = ts
+			m.StartTime = e.Timestamp // kept exactly as written
+		}
+		if last.IsZero() || ts.After(*last) {
+			*last = ts
+		}
+	}
+	switch e.Type {
+	case "user":
+		// A compaction is not something the user said, matching how Render
+		// labels it, so it does not count as a user message.
+		if e.IsCompactSummary || e.Message.IsCompactSummary {
+			return
+		}
+		// Same emptiness rule Render uses to decide whether to emit a [User]
+		// line; the cap is irrelevant here, only whether any text survives.
+		if len(texts(e.Message.Content, 1)) > 0 {
+			m.UserMessageCount++
+		}
+	case "assistant":
+		m.AssistantMsgCount++
+	}
+}
+
+// parseTime reads an entry timestamp. The CLI writes RFC3339 with a zone; the
+// Nano layout accepts both the fractional and non-fractional forms.
+func parseTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }

@@ -3,6 +3,7 @@ package stage
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/brianleach/weekly-insights/internal/model"
@@ -127,5 +128,121 @@ func TestBuildToleratesMissingAccountFile(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "stage")
 	if _, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(t.TempDir(), "nope.json")}, nil, dst); err != nil {
 		t.Errorf("a missing account file is not fatal on platforms that keep login state elsewhere: %v", err)
+	}
+}
+
+// A session with a transcript but no cached meta record must still be staged.
+// The builtin only writes session-meta when /insights runs, so requiring a
+// cached record would drop exactly the sessions the report is newest about.
+func TestBuildStagesTranscriptWithoutMeta(t *testing.T) {
+	p, home := fakeHome(t)
+	// ccc has a transcript and neither a meta record nor any facets.
+	proj := filepath.Join(p.ClaudeHome, "projects", "-Users-me-code")
+	if err := os.WriteFile(filepath.Join(proj, "ccc.jsonl"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "stage")
+	sessions := []model.Session{{Meta: model.SessionMeta{SessionID: "ccc"}}}
+	c, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, sessions, dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c != (Counts{Sessions: 1, Transcripts: 1}) {
+		t.Errorf("counts = %+v, want one session and one transcript with no meta or facets", c)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "projects", "-Users-me-code", "ccc.jsonl")); err != nil {
+		t.Errorf("transcript should be staged even with no cached meta: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "usage-data", "session-meta", "ccc.json")); !os.IsNotExist(err) {
+		t.Errorf("no meta should be invented for ccc, stat err = %v", err)
+	}
+}
+
+// The stage holds copies of raw transcripts, which carry prompts and project
+// names, so every directory and file it owns is owner-only.
+func TestBuildPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits are not meaningful on windows")
+	}
+	p, home := fakeHome(t)
+	// A world-readable file in the sidecar session dir, so the copy is shown to
+	// tighten the mode rather than carry the source's over.
+	if err := os.WriteFile(filepath.Join(p.ClaudeHome, "projects", "-Users-me-code", "aaa", "title.txt"),
+		[]byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "stage")
+	sessions := []model.Session{{Meta: model.SessionMeta{SessionID: "aaa"}}}
+	if _, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, sessions, dst); err != nil {
+		t.Fatal(err)
+	}
+	dirs := []string{
+		dst,
+		filepath.Join(dst, "projects"),
+		filepath.Join(dst, "projects", "-Users-me-code"),
+		filepath.Join(dst, "projects", "-Users-me-code", "aaa"),
+		filepath.Join(dst, "usage-data", "session-meta"),
+		filepath.Join(dst, "usage-data", "facets"),
+	}
+	for _, d := range dirs {
+		fi, err := os.Stat(d)
+		if err != nil {
+			t.Errorf("stat %s: %v", d, err)
+			continue
+		}
+		if got := fi.Mode().Perm(); got != 0o700 {
+			t.Errorf("%s mode = %o, want 0700", d, got)
+		}
+	}
+	files := []string{
+		filepath.Join(dst, ".claude.json"),
+		filepath.Join(dst, ".credentials.json"),
+		filepath.Join(dst, "projects", "-Users-me-code", "aaa.jsonl"),
+		filepath.Join(dst, "projects", "-Users-me-code", "aaa", "title.txt"),
+		filepath.Join(dst, "usage-data", "session-meta", "aaa.json"),
+		filepath.Join(dst, "usage-data", "facets", "aaa.json"),
+	}
+	for _, f := range files {
+		fi, err := os.Lstat(f)
+		if err != nil {
+			t.Errorf("stat %s: %v", f, err)
+			continue
+		}
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("%s mode = %o, want 0600", f, got)
+		}
+	}
+}
+
+// copyDir carries sidecar directories along, and they get the same treatment as
+// everything else the stage owns.
+func TestCopyDirPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits are not meaningful on windows")
+	}
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "title.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "copy")
+	if err := copyDir(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dst, "nested"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Errorf("copied dir mode = %o, want 0700", got)
+	}
+	fi, err = os.Stat(filepath.Join(dst, "nested", "title.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("copied file mode = %o, want 0600, source mode must not carry over", got)
 	}
 }

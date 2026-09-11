@@ -5,9 +5,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/brianleach/weekly-insights/internal/model"
 	"github.com/brianleach/weekly-insights/internal/store"
 )
 
@@ -285,5 +287,148 @@ func TestWriteForMissingTranscript(t *testing.T) {
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("error should unwrap to fs.ErrNotExist, got %v", err)
+	}
+}
+
+// Rendered transcripts hold prompts and project paths, so the output directory
+// and files must not be readable by anyone but the owner.
+func TestWriteForPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits are not meaningful on windows")
+	}
+	p := claudeHome(t, "sess-4", `{"type":"user","message":{"content":"hello"}}`)
+	out := filepath.Join(t.TempDir(), "prepared")
+	if err := WriteFor(p, "sess-4", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{}); err != nil {
+		t.Fatalf("WriteFor: %v", err)
+	}
+	di, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("stat output dir: %v", err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("output dir mode = %o, want 0700", got)
+	}
+	fi, err := os.Stat(filepath.Join(out, "sess-4.txt"))
+	if err != nil {
+		t.Fatalf("stat output file: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("output file mode = %o, want 0600", got)
+	}
+}
+
+// A destination left over from an earlier, looser run keeps its mode through a
+// plain WriteFile, so overwriting has to tighten it explicitly.
+func TestWriteForTightensExistingFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits are not meaningful on windows")
+	}
+	p := claudeHome(t, "sess-5", `{"type":"user","message":{"content":"hello"}}`)
+	out := t.TempDir()
+	stale := filepath.Join(out, "sess-5.txt")
+	if err := os.WriteFile(stale, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFor(p, "sess-5", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{}); err != nil {
+		t.Fatalf("WriteFor: %v", err)
+	}
+	fi, err := os.Stat(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("overwritten file mode = %o, want 0600", got)
+	}
+}
+
+func summarize(t *testing.T, id string, lines ...string) model.SessionMeta {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, id+".jsonl")
+	body := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+	m, err := Summarize(path)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	return m
+}
+
+// The derived record has to carry everything selection reads: an id, a project,
+// a start, a duration and the two message counts.
+func TestSummarize(t *testing.T) {
+	// Timestamps deliberately out of order: nothing guarantees the file is
+	// sorted, and the window bounds must still be the min and the max.
+	m := summarize(t, "sess-summary",
+		`{"type":"user","timestamp":"2026-09-10T10:30:00Z","cwd":"/Users/me/code/fixture","message":{"content":"fix the build"}}`,
+		`{"type":"assistant","timestamp":"2026-09-10T10:00:00Z","cwd":"/Users/me/code/fixture","message":{"content":[{"type":"text","text":"looking"},{"type":"tool_use","name":"Read"}]}}`,
+		`{"type":"user","timestamp":"2026-09-10T11:00:00Z","message":{"content":[{"type":"text","text":"try again"}]}}`,
+		`{"type":"assistant","timestamp":"2026-09-10T10:45:00Z","message":{"content":[{"type":"text","text":"done"}]}}`,
+	)
+	if m.SessionID != "sess-summary" {
+		t.Errorf("SessionID = %q, want the filename without .jsonl", m.SessionID)
+	}
+	if m.ProjectPath != "/Users/me/code/fixture" {
+		t.Errorf("ProjectPath = %q, want the transcript's own cwd", m.ProjectPath)
+	}
+	if m.StartTime != "2026-09-10T10:00:00Z" {
+		t.Errorf("StartTime = %q, want the earliest timestamp as written", m.StartTime)
+	}
+	if m.DurationMinutes != 60 {
+		t.Errorf("DurationMinutes = %v, want 60", m.DurationMinutes)
+	}
+	if m.UserMessageCount != 2 {
+		t.Errorf("UserMessageCount = %d, want 2 (string and array form both count)", m.UserMessageCount)
+	}
+	if m.AssistantMsgCount != 2 {
+		t.Errorf("AssistantMsgCount = %d, want 2", m.AssistantMsgCount)
+	}
+	// Everything the builtin derives from tool payloads stays zero rather than
+	// being half-guessed from the transcript.
+	if m.ToolErrors != 0 || m.InputTokens != 0 || m.GitCommits != 0 || m.FilesModified != 0 {
+		t.Errorf("non-selection counters should be left zero, got %+v", m)
+	}
+}
+
+// A user turn only counts when it carries text, which is the same rule Render
+// uses to decide whether to emit a [User] line.
+func TestSummarizeCountsOnlyTextUserTurns(t *testing.T) {
+	m := summarize(t, "sess-counts",
+		`{"type":"user","timestamp":"2026-09-10T10:00:00Z","message":{"content":"real ask"}}`,
+		`{"type":"user","timestamp":"2026-09-10T10:01:00Z","message":{"content":"   "}}`,
+		`{"type":"user","timestamp":"2026-09-10T10:02:00Z","message":{"content":[{"type":"tool_result","is_error":true}]}}`,
+		`{"type":"user","timestamp":"2026-09-10T10:03:00Z","isCompactSummary":true,"message":{"content":"recap"}}`,
+		`{"type":"system","timestamp":"2026-09-10T10:04:00Z","message":{"content":"boot"}}`,
+	)
+	if m.UserMessageCount != 1 {
+		t.Errorf("UserMessageCount = %d, want 1", m.UserMessageCount)
+	}
+	if m.AssistantMsgCount != 0 {
+		t.Errorf("AssistantMsgCount = %d, want 0", m.AssistantMsgCount)
+	}
+}
+
+// The tail of a live transcript is routinely half-written, and a session may
+// carry no cwd at all; neither is fatal.
+func TestSummarizeTolerantOfPartialLines(t *testing.T) {
+	m := summarize(t, "sess-partial",
+		`{"type":"user","timestamp":"2026-09-10T10:00:00Z","message":{"content":"a"}}`,
+		"",
+		"not json",
+		`{"type":"user","timestamp":"2026-09-10T10:05:00Z","message":{"content":`,
+	)
+	if m.UserMessageCount != 1 || m.ProjectPath != "" || m.StartTime != "2026-09-10T10:00:00Z" {
+		t.Errorf("got %+v", m)
+	}
+	if m.DurationMinutes != 0 {
+		t.Errorf("DurationMinutes = %v, want 0 for a single-timestamp session", m.DurationMinutes)
+	}
+}
+
+func TestSummarizeMissingFile(t *testing.T) {
+	if _, err := Summarize(filepath.Join(t.TempDir(), "nope.jsonl")); err == nil {
+		t.Fatal("expected an error for a missing transcript")
 	}
 }

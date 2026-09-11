@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,5 +270,113 @@ func TestParseStartFormats(t *testing.T) {
 	}
 	if _, ok := parseStart("not a time"); ok {
 		t.Error("parseStart(garbage) should fail")
+	}
+}
+
+// writeTranscript lays out projects/<encoded path>/<id>.jsonl under the fake
+// ClaudeHome, which is where Select globs for sessions the cache never saw.
+func writeTranscript(t *testing.T, p store.Paths, id string, lines ...string) {
+	t.Helper()
+	dir := filepath.Join(p.Transcripts(), "-Users-me-code-repo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir transcripts: %v", err)
+	}
+	body := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, id+".jsonl"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+}
+
+// substantiveTranscript is a two-user-turn, one-hour session at the given time,
+// which is the smallest shape that survives the substantive filter.
+func substantiveTranscript(t *testing.T, p store.Paths, id, project string, at time.Time) {
+	t.Helper()
+	writeTranscript(t, p, id,
+		`{"type":"user","timestamp":"`+at.Format(time.RFC3339)+`","cwd":"`+project+`","message":{"content":"first ask"}}`,
+		`{"type":"assistant","timestamp":"`+at.Add(30*time.Minute).Format(time.RFC3339)+`","message":{"content":[{"type":"text","text":"ok"}]}}`,
+		`{"type":"user","timestamp":"`+at.Add(time.Hour).Format(time.RFC3339)+`","message":{"content":"second ask"}}`,
+	)
+}
+
+// The builtin writes session-meta only when /insights runs, and caps how many
+// records it writes, so a session can have a transcript and no cached record.
+// It must still reach selection, or a fresh install reports nothing at all.
+func TestSelectIncludesSessionsWithoutCachedMeta(t *testing.T) {
+	at := windowEnd.Add(-2 * time.Hour)
+	p := newStore(t, meta("cached", "/Users/me/code/repo", at))
+	substantiveTranscript(t, p, "uncached", "/Users/me/code/repo", at)
+
+	r, err := Select(p, Options{End: windowEnd, Config: store.DefaultConfig()})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if !equal(sessionIDs(r.Substantive), []string{"cached", "uncached"}) {
+		t.Errorf("substantive = %v, want cached and uncached", sessionIDs(r.Substantive))
+	}
+	if r.Derived != 1 {
+		t.Errorf("Derived = %d, want 1", r.Derived)
+	}
+	var got model.SessionMeta
+	for _, s := range r.Substantive {
+		if s.Meta.SessionID == "uncached" {
+			got = s.Meta
+		}
+	}
+	if got.ProjectPath != "/Users/me/code/repo" || got.UserMessageCount != 2 || got.DurationMinutes != 60 {
+		t.Errorf("derived meta = %+v, want the fields summarized from the transcript", got)
+	}
+}
+
+// A cached record always wins: the derived one is a fallback, not an override.
+func TestSelectPrefersCachedMetaOverTranscript(t *testing.T) {
+	at := windowEnd.Add(-2 * time.Hour)
+	p := newStore(t, meta("both", "/Users/me/code/repo", at))
+	substantiveTranscript(t, p, "both", "/somewhere/else", at)
+
+	r, err := Select(p, Options{End: windowEnd})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if len(r.All) != 1 || r.Derived != 0 {
+		t.Fatalf("All = %v, Derived = %d; want the single cached record", ids(r.All), r.Derived)
+	}
+	if r.All[0].ProjectPath != "/Users/me/code/repo" {
+		t.Errorf("ProjectPath = %q, want the cached value", r.All[0].ProjectPath)
+	}
+}
+
+// The window, exclusion and substantive rules apply to derived records exactly
+// as they do to cached ones.
+func TestSelectAppliesRulesToDerivedMeta(t *testing.T) {
+	at := windowEnd.Add(-2 * time.Hour)
+	p := newStore(t)
+	substantiveTranscript(t, p, "out-of-window", "/Users/me/code/repo", windowEnd.AddDate(0, 0, -30))
+	substantiveTranscript(t, p, "excluded", "/private/tmp/agent-1", at)
+	writeTranscript(t, p, "too-quiet",
+		`{"type":"user","timestamp":"`+at.Format(time.RFC3339)+`","cwd":"/Users/me/code/repo","message":{"content":"only ask"}}`,
+		`{"type":"assistant","timestamp":"`+at.Add(time.Hour).Format(time.RFC3339)+`","message":{"content":[{"type":"text","text":"ok"}]}}`,
+	)
+	// Unreadable and undateable transcripts are skipped, not fatal.
+	writeTranscript(t, p, "garbage", "not json at all")
+	substantiveTranscript(t, p, "keeper", "/Users/me/code/repo", at)
+
+	r, err := Select(p, Options{End: windowEnd, Config: store.DefaultConfig()})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if !equal(sessionIDs(r.Substantive), []string{"keeper"}) {
+		t.Errorf("substantive = %v, want [keeper]", sessionIDs(r.Substantive))
+	}
+	// too-quiet survives the exclusions and is only dropped by the substantive
+	// filter, so it is still counted as kept.
+	if !equal(ids(r.Kept), []string{"keeper", "too-quiet"}) {
+		t.Errorf("kept = %v, want keeper and too-quiet", ids(r.Kept))
+	}
+	if r.ExcludedScratch != 1 {
+		t.Errorf("ExcludedScratch = %d, want 1", r.ExcludedScratch)
+	}
+	// Derived counts in-window sessions only, so the 30-day-old one is not in it.
+	if r.Derived != 3 {
+		t.Errorf("Derived = %d, want 3 (excluded, too-quiet, keeper)", r.Derived)
 	}
 }

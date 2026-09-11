@@ -158,9 +158,13 @@ func TrendHTML(snaps []snapshot.Snapshot) string {
 		total += s.Sessions.Substantive
 	}
 	stats(&b, []stat{{fmt.Sprint(len(snaps)), "weeks"}, {fmt.Sprint(total), "sessions"}})
-
 	b.WriteString("<p class=\"section-intro\">One card per metric, one bar per week. Bars are scaled to the largest week for that metric. Lower is better for everything except the last card.</p>\n")
 	b.WriteString("<div class=\"charts-row\">\n")
+
+	// Sessions is a count rather than a rate, so it gets its own card instead
+	// of going through weekMetric.
+	sessionsCard(&b, snaps)
+
 	weekMetric := func(label, key, color string, isPct bool) {
 		fmt.Fprintf(&b, "<div class=\"chart-card\"><div class=\"chart-title\">%s</div>\n", esc(label))
 		max := 0.0
@@ -188,17 +192,6 @@ func TrendHTML(snaps []snapshot.Snapshot) string {
 		}
 		b.WriteString("</div>\n")
 	}
-	weekMetric("Sessions", "", "#64748b", false) // placeholder replaced below
-	b.Reset()
-	// Rebuild without the placeholder: sessions is a count, not a rate.
-	pageOpen(&b, "Weekly Trend")
-	b.WriteString("<h1>Weekly Trend</h1>\n")
-	fmt.Fprintf(&b, "<div class=\"subtitle\">%d weeks, %s to %s</div>\n",
-		len(snaps), longDate(snaps[0].Window.Start), longDate(snaps[len(snaps)-1].Window.End))
-	stats(&b, []stat{{fmt.Sprint(len(snaps)), "weeks"}, {fmt.Sprint(total), "sessions"}})
-	b.WriteString("<p class=\"section-intro\">One card per metric, one bar per week. Bars are scaled to the largest week for that metric. Lower is better for everything except the last card.</p>\n")
-	b.WriteString("<div class=\"charts-row\">\n")
-	sessionsCard(&b, snaps)
 	for _, m := range tracked {
 		color := "#dc2626"
 		if !m.down {

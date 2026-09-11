@@ -9,11 +9,14 @@ package window
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/brianleach/weekly-insights/internal/model"
 	"github.com/brianleach/weekly-insights/internal/store"
+	"github.com/brianleach/weekly-insights/internal/transcript"
 )
 
 // DefaultDays is one week, the cadence the whole tool is built around.
@@ -38,6 +41,11 @@ type Result struct {
 	Kept            []model.SessionMeta // after exclusions
 	Substantive     []model.Session     // after exclusions AND the substantive filter, facets attached
 	ExcludedScratch int
+	// Derived counts the in-window sessions whose metadata was summarized from
+	// the transcript because the cache had no record for them. Reports quote it
+	// as coverage: a high count means the builtin cache is far behind, not that
+	// anything went wrong.
+	Derived int
 }
 
 // Select reads the session-meta cache and returns the sessions in the window.
@@ -57,6 +65,7 @@ func Select(p store.Paths, o Options) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("loading session metadata: %w", err)
 	}
+	metas, derived := withUncached(p, metas)
 
 	res := Result{Start: start, End: end}
 	for _, m := range metas {
@@ -67,6 +76,9 @@ func Select(p store.Paths, o Options) (Result, error) {
 			continue
 		}
 		res.All = append(res.All, m)
+		if derived[m.SessionID] {
+			res.Derived++
+		}
 		if !o.IncludeScratch && o.Config.Excluded(m.ProjectPath) {
 			res.ExcludedScratch++
 			continue
@@ -87,6 +99,44 @@ func Select(p store.Paths, o Options) (Result, error) {
 		return a.Before(b)
 	})
 	return res, nil
+}
+
+// withUncached appends a summarized record for every transcript that has no
+// cached meta, and reports which session ids those were.
+//
+// The builtin only writes session-meta when /insights runs, and caps how many
+// records it writes per run, so the cache is a partial view of the sessions on
+// disk and an untouched install has none at all. Selecting from the cache alone
+// therefore makes recent work invisible and can make the whole tool report
+// nothing. Everything downstream treats a derived record like a cached one: the
+// window, exclusion and substantive rules are applied unchanged.
+func withUncached(p store.Paths, metas []model.SessionMeta) ([]model.SessionMeta, map[string]bool) {
+	seen := make(map[string]bool, len(metas))
+	for _, m := range metas {
+		seen[m.SessionID] = true
+	}
+	derived := map[string]bool{}
+	// Glob output is sorted, so the appended records are in a stable order.
+	paths, err := filepath.Glob(filepath.Join(p.Transcripts(), "*", "*.jsonl"))
+	if err != nil {
+		return metas, derived
+	}
+	for _, tp := range paths {
+		id := strings.TrimSuffix(filepath.Base(tp), ".jsonl")
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		m, err := transcript.Summarize(tp)
+		// A transcript that cannot be read is skipped rather than fatal: it is
+		// one missing session, and the cached population is still reportable.
+		if err != nil || m.SessionID == "" {
+			continue
+		}
+		derived[m.SessionID] = true
+		metas = append(metas, m)
+	}
+	return metas, derived
 }
 
 // isSubstantive reports whether a session is worth analyzing. Same filter the

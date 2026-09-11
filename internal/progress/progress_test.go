@@ -1,10 +1,13 @@
 package progress
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/brianleach/weekly-insights/internal/runner"
 )
 
 // fixture mimics the builtin report's markup with synthetic content.
@@ -147,25 +150,95 @@ func TestRenderEscapesAndFallsBack(t *testing.T) {
 	}
 }
 
-func TestRunWithFakeClaude(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "claude")
-	script := "#!/bin/sh\n" +
-		"[ -z \"$CLAUDECODE\" ] || { echo nested; exit 3; }\n" +
-		"[ \"$1\" = \"-p\" ] || { echo bad args; exit 3; }\n" +
-		"grep -q 'WEEK ENDING 2026-09-11' || { echo 'stdin missing weeks'; exit 3; }\n" +
-		"echo '{\"verdict\":\"ok\",\"recurring\":[],\"resolved\":[],\"suggestions\":[],\"already_have\":[],\"numbers\":\"\",\"one_change\":\"c\"}'\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+func fakeClaude(t *testing.T, body string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CLAUDECODE", "1")
+	return bin
+}
+
+func oneWeek(t *testing.T) Input {
+	t.Helper()
 	p := writeReport(t, t.TempDir(), "insights-7d-2026-09-11.html")
-	w, _ := Extract(p)
-	m, raw, err := Run(Input{Weeks: []Week{w}}, Options{ClaudeBin: bin})
+	w, err := Extract(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Input{Weeks: []Week{w}}
+}
+
+const memoJSON = `{"verdict":"ok","recurring":[],"resolved":[],"suggestions":[],"already_have":[],"numbers":"","one_change":"c"}`
+
+func TestRunWithFakeClaude(t *testing.T) {
+	bin := fakeClaude(t, `
+[ -z "$CLAUDECODE" ] || { echo nested; exit 3; }
+[ "$1" = "-p" ] || { echo bad args; exit 3; }
+grep -q 'WEEK ENDING 2026-09-11' || { echo 'stdin missing weeks'; exit 3; }
+echo '`+memoJSON+`'
+`)
+	t.Setenv("CLAUDECODE", "1")
+	m, raw, err := Run(oneWeek(t), Options{ClaudeBin: bin})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, raw)
 	}
 	if m.Verdict != "ok" || m.OneChange != "c" {
 		t.Errorf("memo = %+v", m)
+	}
+}
+
+// A token in the parent environment is stripped by runner.BaseEnv, so the only
+// way the child sees one is Options.Token putting it back.
+func TestRunPassesTokenOnlyWhenSet(t *testing.T) {
+	bin := fakeClaude(t, `
+[ "$WANT_TOKEN" = "$CLAUDE_CODE_OAUTH_TOKEN" ] || { echo "token = '$CLAUDE_CODE_OAUTH_TOKEN', want '$WANT_TOKEN'"; exit 3; }
+echo '`+memoJSON+`'
+`)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-parent-should-not-leak")
+	in := oneWeek(t)
+
+	t.Setenv("WANT_TOKEN", "tok")
+	if _, raw, err := Run(in, Options{ClaudeBin: bin, Token: "tok"}); err != nil {
+		t.Errorf("with a token: %v\n%s", err, raw)
+	}
+
+	t.Setenv("WANT_TOKEN", "")
+	if _, raw, err := Run(in, Options{ClaudeBin: bin}); err != nil {
+		t.Errorf("without a token the child must see none: %v\n%s", err, raw)
+	}
+}
+
+// A failed process and an unparseable reply are different outcomes: only the
+// second leaves an answer the caller may keep.
+func TestRunSeparatesExecFailureFromParseFailure(t *testing.T) {
+	in := oneWeek(t)
+
+	bin := fakeClaude(t, `echo "partial reply {"; exit 2`)
+	_, raw, err := Run(in, Options{ClaudeBin: bin})
+	if !errors.Is(err, ErrExec) {
+		t.Errorf("a nonzero exit must report ErrExec, got %v", err)
+	}
+	if errors.Is(err, ErrParse) {
+		t.Error("a failed process must not be reported as a parse failure")
+	}
+	if raw != "" {
+		t.Errorf("a failed process must not offer a fallback reply, got %q", raw)
+	}
+
+	bin = fakeClaude(t, `echo "no json at all"; exit 0`)
+	_, raw, err = Run(in, Options{ClaudeBin: bin})
+	if !errors.Is(err, ErrParse) {
+		t.Errorf("a successful run with an unparseable reply must report ErrParse, got %v", err)
+	}
+	if !strings.Contains(raw, "no json at all") {
+		t.Errorf("the raw reply must survive for the fallback page, got %q", raw)
+	}
+}
+
+func TestRunDetectsNotLoggedIn(t *testing.T) {
+	bin := fakeClaude(t, `echo "Not logged in · Please run /login"; exit 0`)
+	if _, _, err := Run(oneWeek(t), Options{ClaudeBin: bin}); !errors.Is(err, runner.ErrNotLoggedIn) {
+		t.Errorf("expected runner.ErrNotLoggedIn, got %v", err)
 	}
 }

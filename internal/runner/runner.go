@@ -38,6 +38,7 @@ type Result struct {
 	Report          string // path of the copied report
 	HarvestedMeta   int    // session-meta files new to the real cache
 	HarvestedFacets int    // facet files new to the real cache
+	HarvestErrors   int    // harvest copies that failed, for the caller to report
 }
 
 // Run executes `claude -p /insights` in the stage and copies the report out.
@@ -68,10 +69,12 @@ func Run(o Options) (Result, error) {
 	if err != nil {
 		return r, err
 	}
-	if err := os.MkdirAll(filepath.Dir(o.OutPath), 0o755); err != nil {
+	// The report carries prompts and project names, so the directory is owner
+	// only and the file is owner read/write.
+	if err := os.MkdirAll(filepath.Dir(o.OutPath), 0o700); err != nil {
 		return r, fmt.Errorf("creating output directory: %w", err)
 	}
-	if err := copyFile(src, o.OutPath, 0o644); err != nil {
+	if err := copyFile(src, o.OutPath, 0o600); err != nil {
 		return r, fmt.Errorf("copying report: %w", err)
 	}
 	r.Report = o.OutPath
@@ -81,14 +84,20 @@ func Run(o Options) (Result, error) {
 	// the real cache would hold after a normal /insights run, and harvesting
 	// them removes the need to run the builtin cumulatively just to refresh it.
 	// Existing files are never overwritten.
-	r.HarvestedMeta = harvest(sp.SessionMeta(), o.Real.SessionMeta())
-	r.HarvestedFacets = harvest(sp.BuiltinFacets(), o.Real.BuiltinFacets())
+	var metaFailed, facetFailed int
+	r.HarvestedMeta, metaFailed = harvest(sp.SessionMeta(), o.Real.SessionMeta())
+	r.HarvestedFacets, facetFailed = harvest(sp.BuiltinFacets(), o.Real.BuiltinFacets())
+	r.HarvestErrors = metaFailed + facetFailed
 	return r, nil
 }
 
 // BaseEnv is the parent environment minus everything that marks this process
 // as a running Claude Code session. A child started with those markers refuses
 // to run, so any nested `claude -p` must start from this.
+//
+// CLAUDE_CODE_OAUTH_TOKEN is stripped along with them, so a token that happens
+// to sit in the parent environment never leaks into a child by accident. A
+// caller that wants the child authenticated injects the resolved token itself.
 func BaseEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
@@ -127,33 +136,60 @@ func newestReport(usageData string) (string, error) {
 	return matches[len(matches)-1], nil
 }
 
-func harvest(from, to string) int {
+// harvest copies new cache files into the real cache and never overwrites one.
+// Exclusive creation is what makes that true: a Stat-then-truncate pair would
+// still clobber a file written between the two calls. It returns how many were
+// copied and how many failed for a reason other than "already there", and logs
+// nothing itself so the caller decides how to report.
+func harvest(from, to string) (copied, failed int) {
 	matches, _ := filepath.Glob(filepath.Join(from, "*.json"))
-	n := 0
 	for _, m := range matches {
 		dst := filepath.Join(to, filepath.Base(m))
-		if _, err := os.Stat(dst); err == nil {
+		if err := os.MkdirAll(to, 0o700); err != nil {
+			failed++
 			continue
 		}
-		if err := os.MkdirAll(to, 0o755); err != nil {
-			continue
-		}
-		if copyFile(m, dst, 0o644) == nil {
-			n++
+		switch err := copyNew(m, dst, 0o600); {
+		case err == nil:
+			copied++
+		case errors.Is(err, os.ErrExist):
+			// Already in the real cache; leaving it alone is the point.
+		default:
+			failed++
 		}
 	}
-	return n
+	return copied, failed
 }
 
+// copyNew copies src to dst only if dst does not exist, returning an error
+// satisfying errors.Is(err, os.ErrExist) when it does.
+func copyNew(src, dst string, mode os.FileMode) error {
+	return copyInto(src, dst, mode, os.O_CREATE|os.O_EXCL|os.O_WRONLY, false)
+}
+
+// copyFile copies src over dst, creating or truncating it, and forces mode on
+// a destination that already existed with looser permissions.
 func copyFile(src, dst string, mode os.FileMode) error {
+	return copyInto(src, dst, mode, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, true)
+}
+
+func copyInto(src, dst string, mode os.FileMode, flag int, chmod bool) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	out, err := os.OpenFile(dst, flag, mode)
 	if err != nil {
 		return err
+	}
+	// O_CREATE applies mode only when it creates the file, so an existing
+	// destination keeps whatever permissions it had until this chmod.
+	if chmod {
+		if err := out.Chmod(mode); err != nil {
+			out.Close()
+			return err
+		}
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
