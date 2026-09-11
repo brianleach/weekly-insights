@@ -1,22 +1,50 @@
 ---
 name: weekly-insights
-description: Generate a weekly Claude Code usage report scoped to a time window, with week-over-week deltas on friction, unverified claims, unsanctioned actions, and ignored preferences. Use when the user says "weekly insights", "how did this week go", "run my weekly review", "did last week's corrections stick", or wants a time-scoped alternative to the builtin /insights, which is cumulative and cannot show trends.
+description: Run the real Claude Code /insights report over a time window (last N days) instead of all history, and optionally track week-over-week trends. Use when the user says "weekly insights", "insights for the last week", "run insights for the last N days", "how did this week go", or "did last week's corrections stick".
 ---
 
 # Weekly insights
 
-Drives the `weekly-insights` binary. The binary does all counting, normalizing,
-and rendering; this skill supplies the one thing it deliberately does not do,
-which is run a model over the transcripts to extract facets.
+Drives the `weekly-insights` binary. The main job is one command:
 
-Install the binary first:
+```bash
+weekly-insights insights --days 7 --open
+```
+
+That stages a config directory holding only the window's sessions, runs the user's
+own `claude -p /insights` against it, and copies the resulting report to
+`~/claude-weekly-insights/insights-7d-<end>.html`. It is the builtin report, same
+sections and format, restricted to the window. Do not summarize it back to the user
+unless asked: they read it themselves.
+
+Install if missing:
 
 ```bash
 go install github.com/brianleach/weekly-insights/cmd/weekly-insights@latest
-weekly-insights --help
 ```
 
-## Procedure
+## Running the report
+
+```bash
+weekly-insights insights --days 7 --open              # this week
+weekly-insights insights --days 7 --end 2026-09-04    # a past week
+weekly-insights insights --days 30                    # a month
+```
+
+The run takes a few minutes; it is a real `/insights` run, just over fewer sessions.
+Print the path it returns.
+
+If it exits with "not logged in", the one-time token setup has not been done. The
+error message carries the steps. `claude setup-token` is an interactive login, so
+ask the user to run it themselves (in Claude Code, `! claude setup-token`), then to
+store the printed token in the keychain as the message describes. Never handle the
+token value yourself.
+
+## Trends across weeks (optional)
+
+The builtin cannot compare weeks. When the user wants that, build canonical facets
+for the window and snapshot it. Facets also get seeded into the next `insights` run,
+which makes the builtin's charts use a stable vocabulary.
 
 ### 1. Check coverage
 
@@ -24,22 +52,15 @@ weekly-insights --help
 weekly-insights select --days 7
 ```
 
-Reports sessions in the window, how many were excluded as scratch, how many are
-substantive, and how many still need canonical facets.
-
-Sessions counted as needing extraction include ones that already have builtin
-facets, because those use free-form labels and cannot be trended.
-
 ### 2. Extract facets
 
 ```bash
 WORK=$(mktemp -d)
 weekly-insights prepare --days 7 --out "$WORK"
-ls "$WORK"
 ```
 
-Fan out subagents over the prepared transcripts. Give each 4 to 6 sessions, and
-launch them in a single message so they run concurrently. Mandate:
+Fan out subagents over the prepared transcripts, 4 to 6 sessions each, launched in a
+single message. Mandate:
 
 > Run `weekly-insights prompt` and follow it exactly. For each transcript file
 > listed below, read it and write the resulting JSON object to
@@ -47,64 +68,27 @@ launch them in a single message so they run concurrently. Mandate:
 > vocabularies in that prompt, never invent a label. One file in, one file out.
 > Do not modify anything else. Report only the count written.
 
-Delegated volume work like this should run on the cheaper coding model, not the
+Delegated volume work like this runs on the cheaper coding model, not the
 session's model.
 
-### 3. Validate
+### 3. Validate, snapshot, report
 
 ```bash
 weekly-insights validate --fix
-```
-
-Catches invented labels, bad enums, malformed JSON. Re-extract anything that
-comes back unparseable.
-
-### 4. Snapshot and report
-
-```bash
 weekly-insights aggregate --days 7
-weekly-insights report
 weekly-insights report --trend
+weekly-insights report --html --out ~/claude-weekly-insights
 ```
 
-`aggregate --explain` prints how every free-form label collapsed, so the
-normalizer stays auditable.
+### 4. Judgment
 
-### 5. Write the analysis
-
-The binary produces numbers; you write the judgment. Ground every claim in the
-snapshot and keep it short. Lead with the answer.
-
-Cover, in this order:
-
-1. **Did last week's corrections stick?** Read `user_corrections` from the prior
-   snapshot, then check whether the same friction type recurred this week. This
-   is the single most useful output. Name the correction and say plainly whether
-   it recurred.
-2. **What moved.** Only changes larger than normal week-to-week noise. At roughly
-   30 sessions a week, a shift of one or two events is not a trend: say so rather
-   than narrating it. If the two windows differ in `sessions.facet_source`, say
-   up front that the comparison is measurement, not behavior.
-3. **One thing to change.** A single concrete adjustment, ideally one line in
-   CLAUDE.md, not a list of five.
-
-Do not restate tables the report already printed. Do not pad with observations
-the user did not ask for.
-
-## Backfilling earlier weeks
-
-Snapshots are built from cached data, so prior weeks can be reconstructed:
-
-```bash
-weekly-insights aggregate --days 7 --end 2026-09-04
-weekly-insights report --current 2026-09-04
-```
-
-Coverage for older windows is whatever the builtin happened to cache, normalized.
-Run step 2 with `--end` to raise it.
+Only when asked. Ground every claim in the snapshot, lead with the answer, and cover:
+did last week's corrections recur; what moved beyond noise (at ~30 sessions a week,
+one or two events is not a trend; if `sessions.facet_source` differs between the
+two windows say the comparison is measurement, not behavior); one concrete change.
+Do not restate what the report already shows.
 
 ## Caveats
 
-See the "Reading the output" section of the project README. The short version:
-rates not counts, mind the facet source when comparing, hours are wall clock and
-weak, satisfaction skews positive, and only the deterministic counters are exact.
+Hours are wall clock and weak. Satisfaction skews positive. Only `session-meta`
+counters are exact; everything from facets is a model's reading of a transcript.

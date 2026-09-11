@@ -1,18 +1,20 @@
-// Command weekly-insights reports on Claude Code usage over a time window,
-// with week-over-week trends.
+// Command weekly-insights runs Claude Code's builtin /insights over a time
+// window, and tracks week-over-week trends alongside it.
 //
-// Claude Code's builtin /insights is cumulative over all history and takes no
-// arguments, so a week of changed behavior is averaged against months of the
-// old pattern. This command scopes to a window, pins a fixed label vocabulary
-// so counts stay comparable, and diffs each run against the previous one.
-//
-// It reads only local files and makes no network calls.
+// The builtin is cumulative over all history and takes no arguments, so a week
+// of changed behavior is averaged against months of the old pattern. The
+// insights subcommand stages a config directory holding only the window's
+// sessions and runs the user's own Claude Code against it; the report is the
+// builtin's, restricted to the window. The remaining subcommands are local
+// only: they pin a label vocabulary so counts stay comparable and diff each
+// week's snapshot against the previous one.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,7 +22,9 @@ import (
 
 	"github.com/brianleach/weekly-insights/internal/prompt"
 	"github.com/brianleach/weekly-insights/internal/report"
+	"github.com/brianleach/weekly-insights/internal/runner"
 	"github.com/brianleach/weekly-insights/internal/snapshot"
+	"github.com/brianleach/weekly-insights/internal/stage"
 	"github.com/brianleach/weekly-insights/internal/store"
 	"github.com/brianleach/weekly-insights/internal/transcript"
 	"github.com/brianleach/weekly-insights/internal/validate"
@@ -36,6 +40,7 @@ Usage:
   weekly-insights <command> [flags]
 
 Commands:
+  insights    run the real Claude Code /insights over a time window
   select      show what is in the window and how many sessions need facets
   prepare     render the window's transcripts to text for facet extraction
   aggregate   build and save a snapshot of the window
@@ -55,6 +60,8 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "insights":
+		err = cmdInsights(os.Args[2:])
 	case "select":
 		err = cmdSelect(os.Args[2:])
 	case "prepare":
@@ -123,6 +130,88 @@ func (c *commonFlags) resolve() (store.Paths, window.Options, error) {
 		o.End = t.Add(24*time.Hour - time.Second).UTC()
 	}
 	return p, o, nil
+}
+
+// cmdInsights is the command the tool exists for: the builtin report, scoped
+// to a window. Everything else in this binary is a supplement to it.
+func cmdInsights(args []string) error {
+	fs := flag.NewFlagSet("insights", flag.ExitOnError)
+	var cf commonFlags
+	cf.bind(fs)
+	outDir := fs.String("out", "", "directory for the report (default ~/claude-weekly-insights)")
+	openIt := fs.Bool("open", false, "open the report when done")
+	keep := fs.Bool("keep-stage", false, "leave the staged config directory in place for inspection")
+	claudeBin := fs.String("claude", "claude", "path to the Claude Code binary")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p, o, err := cf.resolve()
+	if err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	if *outDir == "" {
+		*outDir = filepath.Join(home, "claude-weekly-insights")
+	}
+
+	r, err := window.Select(p, o)
+	if err != nil {
+		return err
+	}
+	if len(r.Substantive) == 0 {
+		return fmt.Errorf("no substantive sessions in the last %d days", o.Days)
+	}
+
+	st, err := os.MkdirTemp("", "weekly-insights-stage-")
+	if err != nil {
+		return fmt.Errorf("creating stage: %w", err)
+	}
+	if !*keep {
+		// The stage holds a copy of the account file, so it is not left behind.
+		defer os.RemoveAll(st)
+	}
+	counts, err := stage.Build(stage.Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, r.Substantive, st)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "staged %d sessions (%d transcripts, %d meta, %d facets) for %s .. %s\n",
+		counts.Sessions, counts.Transcripts, counts.Meta, counts.Facets,
+		r.Start.Format("2006-01-02"), r.End.Format("2006-01-02"))
+	if *keep {
+		fmt.Fprintf(os.Stderr, "stage kept at %s\n", st)
+	}
+
+	name := fmt.Sprintf("insights-%dd-%s.html", o.Days, r.End.Format("2006-01-02"))
+	fmt.Fprintln(os.Stderr, "running claude -p /insights against the stage; this takes a few minutes ...")
+	res, err := runner.Run(runner.Options{
+		Real: p, Stage: st, ClaudeBin: *claudeBin, Token: runner.ResolveToken(),
+		OutPath: filepath.Join(*outDir, name), Stderr: os.Stderr,
+	})
+	if err == runner.ErrNotLoggedIn {
+		return fmt.Errorf(`%w
+
+A staged config directory cannot see the login stored for the real one, so the
+child needs a long-lived token minted on your subscription. One-time setup:
+
+  1. run:  claude setup-token
+  2. store the token it prints in the macOS keychain under the service name
+     %q (see README, "Authentication"), or export it as CLAUDE_CODE_OAUTH_TOKEN.
+
+The token is read at run time and never written anywhere by this tool.`, err, runner.KeychainService)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "harvested %d session-meta and %d facet files into the real cache\n",
+		res.HarvestedMeta, res.HarvestedFacets)
+	fmt.Println(res.Report)
+	if *openIt {
+		_ = exec.Command("open", res.Report).Start()
+	}
+	return nil
 }
 
 func cmdSelect(args []string) error {

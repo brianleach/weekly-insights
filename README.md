@@ -1,31 +1,38 @@
 # weekly-insights
 
-Time-windowed usage insights for [Claude Code](https://claude.com/claude-code), with week-over-week trends.
+The real Claude Code `/insights` report, scoped to a time range.
 
-Claude Code ships a builtin `/insights` command that analyzes your sessions. It is
-useful, but it is cumulative over all history and takes no arguments, so a week of
-changed behavior gets averaged against months of the old pattern. If you are trying
-to actually improve how you work, that is the one thing you need to see.
+```
+weekly-insights insights --days 7 --open
+```
 
-This tool scopes to a window, pins a fixed label vocabulary so counts are comparable
-across weeks, and diffs each run against the previous one.
+Claude Code's builtin `/insights` is good, but it is cumulative over all history
+and takes no arguments. If you read it every week looking for things to fix, a week
+of changed behavior gets averaged against months of the old pattern and nothing
+ever visibly moves. This tool runs the builtin over just the sessions inside a
+window and hands you the report it writes. Same sections, same format, one week.
 
-## What it does differently
+## How it works
 
-| | builtin `/insights` | weekly-insights |
-|---|---|---|
-| Time range | all history, not configurable | `--days N`, any window |
-| Labels | free-form, model invents per session | fixed vocabulary, enforced |
-| Memory | none, each run stands alone | snapshots on disk, diffed each run |
-| Scratch sessions | counted as your work | filtered by config |
-| Comparison | absolute counts | per-session rates |
+`/insights` reads everything under the Claude config directory and honors
+`CLAUDE_CONFIG_DIR`. So the tool builds a temporary config directory that contains
+only the window:
 
-The label problem is worth spelling out, because it is what makes trends possible.
-The builtin ships a canonical vocabulary internally but never puts it in its
-extraction prompt, so the model invents a label per session. On one real corpus,
-"fix a bug" appeared as `bug_fixing`, `bug_fix`, `bug_fix_implementation`,
-`ui_bug_fix`, and `test_and_ci_fixes`. You cannot chart that. This tool pins the
-vocabulary in the prompt and normalizes anything already cached in a free-form one.
+- transcripts and per-session caches for the sessions in range
+- symlinks to your real settings, plugins, commands and hooks, so the child behaves
+  like your normal install
+- a copy of the account file, so the child is logged in as you
+
+then runs `claude -p /insights` against it, copies the report out, and deletes the
+stage. Nothing in the builtin is reimplemented; the report is whatever your installed
+Claude Code produces.
+
+Two useful side effects. The child computes session metadata for every transcript
+it sees, and the tool harvests that back into your real cache, so sessions the
+cumulative builtin never got to (it caps new analysis per run) stop being invisible.
+And if you have canonical facets for the window (see below), they are seeded into
+the stage, so the builtin's charts use a stable vocabulary and the run skips
+extraction entirely.
 
 ## Install
 
@@ -33,67 +40,88 @@ vocabulary in the prompt and normalizes anything already cached in a free-form o
 go install github.com/brianleach/weekly-insights/cmd/weekly-insights@latest
 ```
 
-Or build from source:
+Or `make build` for a local binary and `make dist` for cross-compiled ones. Standard
+library only, no cgo.
+
+## Authentication
+
+A staged config directory cannot see the login stored for your real one (on macOS
+the keychain entry is tied to the config dir), so the child needs a long-lived token
+minted on your subscription. One-time setup:
 
 ```
-make build      # ./weekly-insights
-make dist       # cross-compiled binaries in dist/
+claude setup-token
 ```
 
-No dependencies beyond the Go standard library, and no cgo, so a single static
-binary works on every supported platform.
+Store the token it prints in the macOS keychain under the service name
+`weekly-insights`:
+
+```
+security add-generic-password -a "$USER" -s weekly-insights -w '<token>' -U
+```
+
+The tool reads it from there on each run. Setting `CLAUDE_CODE_OAUTH_TOKEN` in the
+environment works too. The token is never written anywhere by this tool, and the
+stage that holds the copied account file is removed when the run ends.
 
 ## Usage
 
 ```
-weekly-insights select    --days 7        # what is in the window, and facet coverage
+weekly-insights insights --days 7                  # this week's report
+weekly-insights insights --days 7 --open           # and open it
+weekly-insights insights --days 7 --end 2026-09-04 # a past week
+weekly-insights insights --days 30                 # a month
+```
+
+Reports land in `~/claude-weekly-insights/insights-<days>d-<end>.html` by default;
+`--out DIR` changes that. `--keep-stage` leaves the staged directory in place for
+inspection. `--include-scratch` disables the project exclusions described below.
+
+## Trends across weeks
+
+The builtin has no memory between runs, so it cannot tell you whether last week's
+correction stuck. A second set of commands covers that:
+
+```
+weekly-insights select    --days 7        # what is in the window, facet coverage
 weekly-insights prepare   --days 7 --out DIR
-weekly-insights aggregate --days 7        # build and save a snapshot
+weekly-insights aggregate --days 7        # save a snapshot
 weekly-insights report                    # newest snapshot vs the previous one
-weekly-insights report --trend            # every snapshot as one table
+weekly-insights report --trend            # every snapshot, one bar per week
+weekly-insights report --html --out DIR   # the same as browsable pages
 weekly-insights validate --fix            # enforce the vocabulary on extracted facets
 weekly-insights prompt                    # print the extraction prompt
 ```
 
-A full pass looks like this:
+This path exists because of a defect in how the builtin labels sessions. It ships a
+canonical vocabulary internally but never puts it in its extraction prompt, so the
+model invents a label per session: on one real corpus "fix a bug" appeared as
+`bug_fixing`, `bug_fix`, `bug_fix_implementation`, `ui_bug_fix` and
+`test_and_ci_fixes`. You cannot chart that. `prompt` pins the vocabulary, `validate`
+enforces it, and `aggregate` normalizes anything already cached in a free-form one.
 
-```
-weekly-insights select --days 7                        # see what needs extraction
-weekly-insights prepare --days 7 --out /tmp/work       # render transcripts to text
-#   ... run the extraction prompt over /tmp/work/*.txt with a model of your choice,
-#   ... writing one JSON object per session to ~/.claude/usage-data/weekly-facets/
-weekly-insights validate --fix
-weekly-insights aggregate --days 7
-weekly-insights report
-```
+The extraction step itself is left to you: `prepare` renders transcripts to text and
+`prompt` prints the instructions. Running it through Claude Code is the easy route,
+and `skill/` holds a ready-made skill that fans it out to subagents. Snapshots record
+per-session rates (so a busy week is not penalised), the three friction types that
+generic extractors miss (`unverified_claim`, `unwanted_autonomous_action`,
+`ignored_stated_preference`), and every correction the user typed, verbatim.
 
-The extraction step is deliberately left to you. This tool does not call any model
-API, hold any credential, or make any network request. `prepare` renders transcripts
-to plain text and `prompt` prints the instructions; how you run the model over them
-is your choice. Doing it through Claude Code itself is the path of least resistance,
-and a ready-made skill for that lives in `skill/`.
-
-Earlier windows can be reconstructed from cached data at any time:
-
-```
-weekly-insights aggregate --days 7 --end 2026-09-04
-weekly-insights report --current 2026-09-04
-```
-
-## What it reads
-
-Everything is local. Nothing is uploaded, and the tool makes no network calls at all.
+## What it reads and writes
 
 | Path | Owner | Used for |
 |---|---|---|
-| `~/.claude/usage-data/session-meta/` | Claude Code | exact per-session counters |
-| `~/.claude/usage-data/facets/` | Claude Code | cached model judgments, normalized on read |
-| `~/.claude/projects/*/*.jsonl` | Claude Code | raw transcripts, read by `prepare` |
+| `~/.claude/projects/*/*.jsonl` | Claude Code | transcripts, linked into the stage |
+| `~/.claude/usage-data/session-meta/` | Claude Code | per-session counters; harvested back, never overwritten |
+| `~/.claude/usage-data/facets/` | Claude Code | cached judgments; harvested back, never overwritten |
+| `~/.claude.json` | Claude Code | account file, copied into the stage |
 | `~/.claude/usage-data/weekly-facets/` | this tool | canonical-vocabulary facets |
 | `~/.claude/usage-data/weekly/` | this tool | snapshots |
+| `~/claude-weekly-insights/` | this tool | reports |
 
-It never writes to the directories Claude Code owns, so the builtin `/insights`
-keeps working exactly as before.
+The `insights` command runs your installed Claude Code, which calls the model API as
+it would for a normal `/insights`. Every other command is local only and makes no
+network calls.
 
 ## Configuration
 
@@ -110,47 +138,22 @@ keeps working exactly as before.
 }
 ```
 
-Sessions whose project path matches are dropped before aggregation. Agent
-scratchpads and eval-harness runs are not work you did, and they can badly
-outnumber real sessions: in one real week they were 163 of 200.
+Sessions whose project path matches are dropped from the window. Agent scratchpads
+and eval-harness runs are not work you did, and they can outnumber real sessions
+badly: in one real week they were 163 of 200. The builtin counts them.
 
-## Reading the output
+## Reading the trend output
 
-Some care is needed to avoid reading noise as signal.
-
-- **Rates, not counts.** Every headline metric is per session, so a busy week is not
-  automatically a worse week.
-- **Mind the facet source.** A window built from normalized builtin facets is not
-  cleanly comparable to one built from canonical extraction, because the two prompts
-  detect different things. Snapshots record the split in `sessions.facet_source`, and
-  the trend table warns when you cross that boundary.
+- **Rates, not counts.** Headline metrics are per session.
+- **Mind the facet source.** Snapshots built from normalized builtin facets are not
+  cleanly comparable to ones built from canonical extraction; `sessions.facet_source`
+  records which, and the trend page warns at the boundary.
 - **Small samples.** At roughly 30 sessions a week, a shift of one or two events is
   not a trend.
-- **Hours are weak.** Session duration is wall clock between the first and last
-  message, so a session left open overnight inflates it. Session and message counts
-  are the reliable volume signals. The builtin has the same distortion.
-- **Satisfaction skews positive.** Continuing without complaint counts as
-  `likely_satisfied`, so watch the dissatisfied and frustrated rate rather than the
-  positive share.
-- **Facets are judgments.** The deterministic fields (tool counts, commits, lines,
-  interruptions, tool errors) come from Claude Code's own cache and are exact.
-  Everything derived from facets is a model's reading of a transcript.
-
-## The vocabulary
-
-Goal categories and friction types are fixed. `weekly-insights prompt` prints the
-full list. Three friction types are additions that generic extractors reliably miss:
-
-- `unverified_claim` — asserting something was done, deployed, or verified without
-  proof, and being challenged on it.
-- `unwanted_autonomous_action` — taking a consequential action nobody asked for.
-- `ignored_stated_preference` — drifting back to a habit you already corrected.
-
-Facets also record `user_corrections`, verbatim. That is what makes the most useful
-question answerable: did last week's correction actually stick?
-
-`weekly-insights aggregate --explain` prints how every free-form label collapsed, so
-the normalizer stays auditable.
+- **Hours are weak.** Duration is wall clock between first and last message. Session
+  and message counts are the reliable volume signals. The builtin has the same
+  distortion.
+- **Facets are judgments.** Only the counters from `session-meta` are exact.
 
 ## License
 
