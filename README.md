@@ -84,9 +84,10 @@ The stage, which holds a copy of your account file, is removed when the run ends
 
 ## Platform support
 
-macOS is tested. Linux should work and has not been exercised. Windows is not
-supported: the stage symlinks your shared config entries, and creating symlinks on
-Windows needs Developer Mode or elevation. `make dist` builds darwin and linux only.
+macOS is tested. Linux is untested, including the credentials-file path described
+under Authentication. Windows is not supported: the stage symlinks your shared config
+entries, and creating symlinks on Windows needs Developer Mode or elevation.
+`make dist` builds darwin and linux only.
 
 ## Usage
 
@@ -97,26 +98,50 @@ weekly-insights insights --days 7 --end 2026-09-04 # a past week
 weekly-insights insights --days 30                 # a month
 ```
 
-Reports land in `~/claude-weekly-insights/insights-<days>d-<end>.html` by default;
-`--out DIR` changes that. `--keep-stage` leaves the staged directory in place for
-inspection. `--include-scratch` disables the project exclusions described below.
+Reports land in `~/claude-weekly-insights/insights-<days>d-<end>.html` by default.
+Flags for `insights`:
+
+- `--days N` window length (default 7); `--end YYYY-MM-DD` window end (default now)
+- `--out DIR` report directory (default `~/claude-weekly-insights`)
+- `--open` open the report when done
+- `--keep-stage` leave the staged config directory in place for inspection
+- `--include-scratch` disable the project exclusions described below
+- `--config FILE` exclusion config; `--claude PATH` Claude Code binary (default `claude`)
 
 ## Trends across weeks
 
 The builtin has no memory between runs, so it cannot tell you whether last week's
-correction stuck. A second set of commands covers that:
+correction stuck. Two separate paths cover that, and it is worth being clear about
+which is which.
+
+`progress` reads the raw weekly reports plus your global `CLAUDE.md` and writes a
+narrative memo. It needs nothing but two or more `insights` reports on disk.
+
+The numeric trend is a second, optional path: `select`, `prepare`, an extraction step
+you run, `validate`, `aggregate`, `report`. It re-extracts each session with a pinned
+vocabulary and saves a snapshot per week. When snapshots exist, `progress` includes
+the resulting trend table in its prompt; when they do not, the memo is prose only.
+
+### Path 1: the progress memo
 
 ```
-weekly-insights select    --days 7        # what is in the window, facet coverage
-weekly-insights prepare   --days 7 --out DIR
-weekly-insights aggregate --days 7        # save a snapshot
-weekly-insights progress  --weeks 4       # judge progression across recent reports
-weekly-insights report                    # newest snapshot vs the previous one
-weekly-insights report --trend            # every snapshot, one bar per week
-weekly-insights report --html --out DIR   # the same as browsable pages
-weekly-insights validate --fix            # enforce the vocabulary on extracted facets
-weekly-insights prompt                    # print the extraction prompt
+weekly-insights progress                  # memo across the last 4 weekly reports
+weekly-insights progress --weeks 6 --open
+weekly-insights progress --dry-run        # print the exact prompt and data, no model call
 ```
+
+Flags for `progress`:
+
+- `--weeks N` how many of the most recent weekly reports to compare (default 4, minimum 2)
+- `--reports DIR` where the `insights-<N>d-<date>.html` files live (default `~/claude-weekly-insights`);
+  the memo is written there as `progress-<N>d-<end>.html`
+- `--open` open the memo when done
+- `--dry-run` print the prompt and data instead of calling the model
+- `--root DIR` usage-data directory to read snapshots from; `--claude PATH` Claude Code binary
+
+`progress` calls the model; see the network section below for exactly what it sends.
+
+### Path 2: the numeric trend
 
 This path exists because of a defect in how the builtin labels sessions. It ships a
 canonical vocabulary internally but never puts it in its extraction prompt, so the
@@ -125,16 +150,40 @@ model invents a label per session: on one real corpus "fix a bug" appeared as
 `test_and_ci_fixes`. You cannot chart that. `prompt` pins the vocabulary, `validate`
 enforces it, and `aggregate` normalizes anything already cached in a free-form one.
 
-`progress` is the one command here that calls the model; see the network section
-below for exactly what it sends.
+The first time through:
 
-The extraction step itself is left to you: `prepare` renders transcripts to text
-(0600 files in a 0700 directory; treat it as sensitive and delete it when you are
-done) and `prompt` prints the instructions. Running it through Claude Code is the easy route,
-and `skill/` holds a ready-made skill that fans it out to subagents. Snapshots record
-per-session rates (so a busy week is not penalised), the three friction types that
-generic extractors miss (`unverified_claim`, `unwanted_autonomous_action`,
-`ignored_stated_preference`), and every correction the user typed, verbatim.
+1. `weekly-insights select --days 7` shows what is in the window and how many
+   sessions still need canonical facets (`--worklist` prints them as JSON lines,
+   `--limit N` caps that).
+2. `weekly-insights prepare --days 7 --out DIR` renders those transcripts to text
+   (`--out` is required; `--all` renders every substantive session, `--limit N` caps).
+   The files are 0600 in a 0700 directory; treat them as sensitive and delete them
+   when you are done.
+3. Run the extraction. Either use the skill in `skill/` from Claude Code, which fans
+   the transcripts out to subagents, or run `weekly-insights prompt` yourself and
+   feed each transcript to a model by hand. Every result must be written as
+   `~/.claude/usage-data/weekly-facets/<session_id>.json`, which is where `aggregate`
+   looks.
+4. `weekly-insights validate --fix` enforces the vocabulary on those files
+   (`--dir DIR` checks another directory). It exits non-zero if anything is left
+   unresolved.
+5. `weekly-insights aggregate --days 7` saves the snapshot (`--explain` shows how
+   free-form labels collapsed, `--no-save` and `--quiet` for dry runs).
+6. `weekly-insights report` renders it.
+
+Flags for `report`:
+
+- `--current LABEL` snapshot to report on (default newest); `--previous LABEL` snapshot
+  to compare against (default the one before)
+- `--trend` every snapshot as one table
+- `--html` render a standalone page; with `--out DIR`, write one page per snapshot plus
+  `trend.html` into that directory
+- `--root DIR` usage-data directory
+
+Snapshots record per-session rates (so a busy week is not penalised), the three
+friction types that generic extractors miss (`unverified_claim`,
+`unwanted_autonomous_action`, `ignored_stated_preference`), and every correction the
+user typed, verbatim.
 
 ## What it reads and writes
 
