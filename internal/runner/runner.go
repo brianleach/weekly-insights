@@ -86,10 +86,10 @@ func Run(o Options) (Result, error) {
 	return r, nil
 }
 
-// childEnv strips the markers that make Claude Code refuse to nest, points the
-// child at the stage, and keeps secure storage on the real config dir so the
-// keychain entry resolves where the platform supports that.
-func childEnv(o Options) []string {
+// BaseEnv is the parent environment minus everything that marks this process
+// as a running Claude Code session. A child started with those markers refuses
+// to run, so any nested `claude -p` must start from this.
+func BaseEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
 		k, _, _ := strings.Cut(kv, "=")
@@ -101,6 +101,13 @@ func childEnv(o Options) []string {
 		}
 		env = append(env, kv)
 	}
+	return env
+}
+
+// childEnv points the child at the stage and keeps secure storage on the real
+// config dir so the keychain entry resolves where the platform supports that.
+func childEnv(o Options) []string {
+	env := BaseEnv()
 	env = append(env,
 		"CLAUDE_CONFIG_DIR="+o.Stage,
 		"CLAUDE_SECURESTORAGE_CONFIG_DIR="+o.Real.ClaudeHome,

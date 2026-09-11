@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/brianleach/weekly-insights/internal/auth"
+	"github.com/brianleach/weekly-insights/internal/progress"
 	"github.com/brianleach/weekly-insights/internal/prompt"
 	"github.com/brianleach/weekly-insights/internal/report"
 	"github.com/brianleach/weekly-insights/internal/runner"
@@ -44,6 +45,7 @@ Usage:
 
 Commands:
   insights    run the real Claude Code /insights over a time window
+  progress    judge progression across the last N weekly reports (separate file)
   auth        store the token insights needs (--check to verify, --clear to remove)
   select      show what is in the window and how many sessions need facets
   prepare     render the window's transcripts to text for facet extraction
@@ -68,6 +70,8 @@ func main() {
 		err = cmdInsights(os.Args[2:])
 	case "auth":
 		err = cmdAuth(os.Args[2:])
+	case "progress":
+		err = cmdProgress(os.Args[2:])
 	case "select":
 		err = cmdSelect(os.Args[2:])
 	case "prepare":
@@ -216,6 +220,91 @@ child needs a long-lived token minted on your subscription. One-time setup:
 	fmt.Println(res.Report)
 	if *openIt {
 		openPath(res.Report)
+	}
+	return nil
+}
+
+// cmdProgress reads the raw weekly reports and asks for a progression memo.
+// It never modifies those reports; the memo is written beside them.
+func cmdProgress(args []string) error {
+	fs := flag.NewFlagSet("progress", flag.ExitOnError)
+	weeks := fs.Int("weeks", 4, "how many of the most recent weekly reports to compare")
+	reportsDir := fs.String("reports", "", "directory holding insights-<N>d-<date>.html (default ~/claude-weekly-insights)")
+	root := fs.String("root", "", "override the usage-data directory (for the numeric trend)")
+	claudeBin := fs.String("claude", "claude", "path to the Claude Code binary")
+	dryRun := fs.Bool("dry-run", false, "print the exact prompt and data instead of calling the model")
+	openIt := fs.Bool("open", false, "open the memo when done")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	if *reportsDir == "" {
+		*reportsDir = filepath.Join(home, "claude-weekly-insights")
+	}
+
+	paths, err := progress.Discover(*reportsDir)
+	if err != nil {
+		return err
+	}
+	if len(paths) < 2 {
+		return fmt.Errorf("need at least two weekly reports in %s to judge progression; found %d (run \"weekly-insights insights\" for more weeks, using --end for past ones)", *reportsDir, len(paths))
+	}
+	if len(paths) > *weeks {
+		paths = paths[len(paths)-*weeks:]
+	}
+	in := progress.Input{}
+	for _, p := range paths {
+		w, err := progress.Extract(p)
+		if err != nil {
+			return err
+		}
+		in.Weeks = append(in.Weeks, w)
+	}
+
+	// The user's global CLAUDE.md is what they actually adopted; the reports
+	// only show what was suggested.
+	if b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md")); err == nil {
+		in.ClaudeMD = string(b)
+	}
+	// The numeric trend is optional context from the snapshot supplement.
+	sp, err := store.DefaultPaths()
+	if err == nil {
+		if *root != "" {
+			sp.Root = *root
+		}
+		if snaps, err := snapshot.List(sp); err == nil && len(snaps) > 1 {
+			in.Trend = report.Trend(snaps)
+		}
+	}
+
+	if *dryRun {
+		fmt.Println(progress.Instructions())
+		fmt.Println()
+		fmt.Print(in.Text())
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "comparing %d weekly reports (%s .. %s) with the default model ...\n",
+		len(in.Weeks), in.Weeks[0].Label, in.Weeks[len(in.Weeks)-1].Label)
+	memo, raw, err := progress.Run(in, progress.Options{ClaudeBin: *claudeBin, Stderr: os.Stderr})
+	if err != nil && raw == "" {
+		return err
+	}
+	if err != nil {
+		// A reply that did not parse is still worth keeping; the page shows it verbatim.
+		fmt.Fprintf(os.Stderr, "warning: %v; writing the raw reply instead\n", err)
+	}
+	last := in.Weeks[len(in.Weeks)-1]
+	out := filepath.Join(*reportsDir, fmt.Sprintf("progress-%dd-%s.html", last.Days, last.Label))
+	if err := os.WriteFile(out, []byte(progress.Render(memo, raw, in)), 0o644); err != nil {
+		return fmt.Errorf("writing memo: %w", err)
+	}
+	fmt.Println(out)
+	if *openIt {
+		openPath(out)
 	}
 	return nil
 }
