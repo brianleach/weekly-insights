@@ -306,3 +306,7 @@ func section(t *testing.T, doc, heading string) string {
 	}
 	return doc[i:]
 }
+
+func correction(date, quote string) snapshot.UserCorrection {
+	return snapshot.UserCorrection{Session: "s", Date: date, Quote: quote}
+}

@@ -40,6 +40,7 @@ Commands:
   prepare     render the window's transcripts to text for facet extraction
   aggregate   build and save a snapshot of the window
   report      render the newest snapshot, diffed against the previous one
+              (--html for a browsable page, --out DIR for one file per week)
   validate    enforce the canonical vocabulary on extracted facets
   prompt      print the facet-extraction prompt
   version     print the version
@@ -315,6 +316,8 @@ func cmdReport(args []string) error {
 	current := fs.String("current", "", "snapshot label to report on (default: newest)")
 	previous := fs.String("previous", "", "snapshot label to compare against (default: the one before)")
 	trend := fs.Bool("trend", false, "print every snapshot as one trend table")
+	asHTML := fs.Bool("html", false, "render as a standalone HTML page")
+	outDir := fs.String("out", "", "with --html, write a file per snapshot into this directory and print the paths")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -332,7 +335,41 @@ func cmdReport(args []string) error {
 	if len(snaps) == 0 {
 		return fmt.Errorf("no snapshots in %s: run \"weekly-insights aggregate\" first", p.Snapshots())
 	}
+	// --out writes the whole history as browsable files, which is the mode for
+	// going through a week in a browser rather than a terminal.
+	if *outDir != "" {
+		if !*asHTML {
+			return fmt.Errorf("--out requires --html")
+		}
+		if err := os.MkdirAll(*outDir, 0o755); err != nil {
+			return fmt.Errorf("creating %s: %w", *outDir, err)
+		}
+		for i := range snaps {
+			var prev *snapshot.Snapshot
+			if i > 0 {
+				prev = &snaps[i-1]
+			}
+			label := snaps[i].Window.Label
+			path := filepath.Join(*outDir, "week-"+label+".html")
+			page := report.WeeklyHTML(snaps[i], prev)
+			if err := os.WriteFile(path, []byte(page), 0o644); err != nil {
+				return fmt.Errorf("writing %s: %w", path, err)
+			}
+			fmt.Println(path)
+		}
+		tp := filepath.Join(*outDir, "trend.html")
+		if err := os.WriteFile(tp, []byte(report.TrendHTML(snaps)), 0o644); err != nil {
+			return fmt.Errorf("writing %s: %w", tp, err)
+		}
+		fmt.Println(tp)
+		return nil
+	}
+
 	if *trend {
+		if *asHTML {
+			fmt.Print(report.TrendHTML(snaps))
+			return nil
+		}
 		fmt.Print(report.Trend(snaps))
 		return nil
 	}
@@ -371,6 +408,10 @@ func cmdReport(args []string) error {
 	// read as a stable week, which is worse than saying there is no baseline.
 	if prev != nil && prev.Window.Label == cur.Window.Label {
 		prev = nil
+	}
+	if *asHTML {
+		fmt.Print(report.WeeklyHTML(cur, prev))
+		return nil
 	}
 	fmt.Print(report.Weekly(cur, prev))
 	return nil
