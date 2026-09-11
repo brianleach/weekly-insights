@@ -34,11 +34,17 @@ weekly-insights insights --days 30                    # a month
 The run takes a few minutes; it is a real `/insights` run, just over fewer sessions.
 Print the path it returns.
 
-If it exits with "not logged in", the one-time token setup has not been done. The
-error message carries the steps. `claude setup-token` is an interactive login, so
-ask the user to run it themselves (in Claude Code, `! claude setup-token`), then to
-store the printed token in the keychain as the message describes. Never handle the
-token value yourself.
+If it exits with "not logged in", the one-time token setup has not been done.
+`claude setup-token` is an interactive login and `weekly-insights auth` takes a
+pasted secret, so ask the user to run both themselves in a terminal:
+
+```bash
+claude setup-token        # prints a token
+weekly-insights auth      # paste it; stored per platform, outside any repo
+weekly-insights auth --check
+```
+
+Never handle the token value yourself, and never write it into a repo checkout.
 
 ## Trends across weeks (optional)
 
