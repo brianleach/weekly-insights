@@ -73,8 +73,14 @@ func TestBuildStagesOnlyTheWindow(t *testing.T) {
 
 	proj := filepath.Join(dst, "projects", "-Users-me-code")
 	for _, f := range []string{"aaa.jsonl", "bbb.jsonl", "aaa"} {
-		if _, err := os.Lstat(filepath.Join(proj, f)); err != nil {
+		fi, err := os.Lstat(filepath.Join(proj, f))
+		if err != nil {
 			t.Errorf("expected %s in staged project dir", f)
+			continue
+		}
+		// The builtin's directory listing skips symlinks, so these must be real.
+		if fi.Mode()&os.ModeSymlink != 0 {
+			t.Errorf("%s must be a copy, not a symlink, or the builtin will not see it", f)
 		}
 	}
 	if _, err := os.Lstat(filepath.Join(proj, "zzz.jsonl")); err == nil {

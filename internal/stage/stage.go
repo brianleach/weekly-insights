@@ -91,9 +91,13 @@ func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
 	return c, nil
 }
 
-// stageTranscript links the session's .jsonl under the same project directory
+// stageTranscript copies the session's .jsonl under the same project directory
 // name the real tree uses, since that name encodes the project path the
 // builtin reports on.
+//
+// Copied, not symlinked: the builtin enumerates transcripts with a directory
+// listing that treats symlinks as neither files nor directories, so a linked
+// transcript is silently skipped and the report comes back empty.
 func stageTranscript(real, sp store.Paths, id string, c *Counts) error {
 	tp := real.TranscriptPath(id)
 	if tp == "" {
@@ -103,17 +107,35 @@ func stageTranscript(real, sp store.Paths, id string, c *Counts) error {
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", projDir, err)
 	}
-	if err := os.Symlink(tp, filepath.Join(projDir, id+".jsonl")); err != nil {
-		return fmt.Errorf("linking transcript %s: %w", id, err)
+	if err := copyFile(tp, filepath.Join(projDir, id+".jsonl"), 0o644); err != nil {
+		return fmt.Errorf("copying transcript %s: %w", id, err)
 	}
 	c.Transcripts++
 	// Per-session sidecar directories (titles and similar) ride along when present.
 	if side := filepath.Join(filepath.Dir(tp), id); isDir(side) {
-		if err := os.Symlink(side, filepath.Join(projDir, id)); err != nil {
-			return fmt.Errorf("linking session dir %s: %w", id, err)
+		if err := copyDir(side, filepath.Join(projDir, id)); err != nil {
+			return fmt.Errorf("copying session dir %s: %w", id, err)
 		}
 	}
 	return nil
+}
+
+// copyDir copies a small flat-or-nested directory tree of regular files.
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		return copyFile(path, target, 0o644)
+	})
 }
 
 // shareConfig symlinks every top-level entry of the real config dir except the
