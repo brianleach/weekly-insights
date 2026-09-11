@@ -8,7 +8,7 @@ description: Run the real Claude Code /insights report over a time window (last 
 Drives the `weekly-insights` binary. The main job is one command:
 
 ```bash
-weekly-insights insights --days 7 --open
+weekly-insights --days 7 --open
 ```
 
 That stages a config directory holding only the window's sessions, runs the user's
@@ -26,9 +26,9 @@ go install github.com/brianleach/weekly-insights/cmd/weekly-insights@latest
 ## Running the report
 
 ```bash
-weekly-insights insights --days 7 --open              # this week
-weekly-insights insights --days 7 --end 2026-09-04    # a past week
-weekly-insights insights --days 30                    # a month
+weekly-insights --days 7 --open              # this week
+weekly-insights --days 7 --end 2026-09-04    # a past week
+weekly-insights --days 30                    # a month
 ```
 
 The run takes a few minutes; it is a real `/insights` run, just over fewer sessions.

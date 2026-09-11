@@ -3,7 +3,7 @@
 The real Claude Code `/insights` report, scoped to a time range.
 
 ```
-weekly-insights insights --days 7 --open
+weekly-insights --days 7 --open
 ```
 
 Claude Code's builtin `/insights` is good, but it is cumulative over all history
@@ -92,14 +92,15 @@ entries, and creating symlinks on Windows needs Developer Mode or elevation.
 ## Usage
 
 ```
-weekly-insights insights --days 7                  # this week's report
-weekly-insights insights --days 7 --open           # and open it
-weekly-insights insights --days 7 --end 2026-09-04 # a past week
-weekly-insights insights --days 30                 # a month
+weekly-insights --days 7                  # this week's report
+weekly-insights --days 7 --open           # and open it
+weekly-insights --days 7 --end 2026-09-04 # a past week
+weekly-insights --days 30                 # a month
 ```
 
 Reports land in `~/claude-weekly-insights/insights-<days>d-<end>.html` by default.
-Flags for `insights`:
+The report is the default action; `weekly-insights run` and `weekly-insights insights`
+are the same thing spelled out. Flags:
 
 - `--days N` window length (default 7); `--end YYYY-MM-DD` window end (default now)
 - `--out DIR` report directory (default `~/claude-weekly-insights`)
@@ -207,7 +208,8 @@ prepared transcripts, reports, snapshots and the progress memo are files of mode
 Two commands make network calls, both by running your installed Claude Code
 (`claude -p`) on your own subscription. Every other command is local only.
 
-**`insights`** runs the builtin `/insights` against the staged config directory.
+**The default report** (`weekly-insights --days N`, also spelled `run`) runs the
+builtin `/insights` against the staged config directory.
 The child sends whatever the builtin sends for a normal `/insights` run: the
 session transcripts in the window (your prompts, assistant replies, file paths and
 project names) plus their cached metadata.

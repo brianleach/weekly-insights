@@ -41,10 +41,10 @@ var version = "dev"
 const usage = `weekly-insights - time-windowed usage insights for Claude Code
 
 Usage:
+  weekly-insights [flags]              run the real Claude Code /insights over a time window
   weekly-insights <command> [flags]
 
 Commands:
-  insights    run the real Claude Code /insights over a time window
   progress    judge progression across the last N weekly reports (separate file)
   auth        store the token insights needs (--check to verify, --clear to remove)
   select      show what is in the window and how many sessions need facets
@@ -56,7 +56,9 @@ Commands:
   prompt      print the facet-extraction prompt
   version     print the version
 
-Run "weekly-insights <command> -h" for a command's flags.
+"weekly-insights run" and "weekly-insights insights" are the same as the default.
+Run "weekly-insights <command> -h" for a command's flags; "weekly-insights run -h"
+for the default's.
 `
 
 func main() {
@@ -65,8 +67,22 @@ func main() {
 		os.Exit(2)
 	}
 	var err error
+	// The weekly report is the default action, so `weekly-insights --days 7`
+	// works without repeating the word. Any leading flag means "run the report";
+	// `insights` and `run` remain as explicit spellings.
+	if strings.HasPrefix(os.Args[1], "-") {
+		switch os.Args[1] {
+		case "-h", "--help", "-v", "--version":
+		default:
+			if err := cmdInsights(os.Args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			return
+		}
+	}
 	switch os.Args[1] {
-	case "insights":
+	case "insights", "run":
 		err = cmdInsights(os.Args[2:])
 	case "auth":
 		err = cmdAuth(os.Args[2:])
