@@ -39,14 +39,36 @@ extraction entirely.
 
 ## Install
 
-Go 1.26 or newer is required (see `go.mod`).
+You need [Claude Code](https://claude.com/claude-code) installed and logged in; the
+tool runs your own `claude` binary and does nothing without it.
+
+**With Go 1.26 or newer:**
 
 ```
 go install github.com/brianleach/weekly-insights/cmd/weekly-insights@latest
 ```
 
-Or `make build` for a local binary and `make dist` for cross-compiled ones. Standard
+That puts the binary in `$(go env GOPATH)/bin`, usually `~/go/bin`. If
+`weekly-insights version` says "command not found", add that directory to your
+`PATH` or symlink the binary somewhere already on it, for example
+`ln -s ~/go/bin/weekly-insights ~/.local/bin/`.
+
+**Without Go:** download the binary for your platform from the
+[releases page](https://github.com/brianleach/weekly-insights/releases), verify it
+against the `SHA256SUMS` file published with it, and put it on your `PATH`. Builds
+are provided for macOS and Linux on arm64 and amd64.
+
+**From a checkout:** `make build` produces `./weekly-insights`; `make install` puts
+it in `$(go env GOPATH)/bin`; `make dist` cross-compiles into `dist/`. Standard
 library only, no cgo.
+
+Then, once:
+
+```
+claude setup-token        # interactive; prints a token
+weekly-insights auth      # paste it (see Authentication for why and where it goes)
+weekly-insights --days 7 --open
+```
 
 ## Authentication
 

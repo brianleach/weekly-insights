@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -36,8 +37,21 @@ import (
 	"github.com/brianleach/weekly-insights/internal/window"
 )
 
-// version is overridden at build time via -ldflags.
+// version is overridden at build time via -ldflags by the Makefile. A plain
+// `go install module@vX.Y.Z` never sets it, so resolvedVersion falls back to
+// the module version Go embeds in the binary, which is what users of the
+// documented install path will have.
 var version = "dev"
+
+func resolvedVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return version
+}
 
 const usage = `weekly-insights - time-windowed usage insights for Claude Code
 
@@ -105,7 +119,7 @@ func main() {
 	case "prompt":
 		fmt.Print(prompt.Extraction())
 	case "version", "--version", "-v":
-		fmt.Println(version)
+		fmt.Println(resolvedVersion())
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -283,7 +297,7 @@ func cmdProgress(args []string) error {
 		return err
 	}
 	if len(paths) < 2 {
-		return fmt.Errorf("need at least two weekly reports in %s to judge progression; found %d (run \"weekly-insights insights\" for more weeks, using --end for past ones)", *reportsDir, len(paths))
+		return fmt.Errorf("need at least two weekly reports in %s to judge progression; found %d (run \"weekly-insights --days 7\" for this week and add --end YYYY-MM-DD for past weeks)", *reportsDir, len(paths))
 	}
 	if len(paths) > *weeks {
 		paths = paths[len(paths)-*weeks:]
