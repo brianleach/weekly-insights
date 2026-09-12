@@ -268,6 +268,37 @@ func TestTrend(t *testing.T) {
 	mustContain(t, got, "Check `facet_source` in each snapshot before reading a jump across that boundary as a real change.")
 }
 
+// The failure block is additive, so the section renders only for the snapshots
+// that carry it and disappears entirely when none does.
+func TestTrendFailuresLine(t *testing.T) {
+	older := base()
+	older.Window.Label = "2026-09-04"
+	older.Sessions.Substantive = 14
+
+	newer := base()
+	newer.Sessions.Substantive = 16
+	newer.Failures = &snapshot.FailureSummary{
+		Total:         48,
+		ByClass:       map[string]int{"classifier_denied": 20, "shell_error": 28},
+		PerSession:    3,
+		SelfInflicted: 24,
+		External:      24,
+	}
+
+	got := Trend([]snapshot.Snapshot{older, newer})
+	mustContain(t, got, "## Failures")
+	mustContain(t, got, "- 2026-09-11: 48 failures (3/session), 24 self-inflicted (1.50/session), 24 external")
+	if strings.Contains(got, "- 2026-09-04:") {
+		t.Errorf("snapshot without a failure block appeared in the section:\n%s", got)
+	}
+}
+
+func TestTrendOmitsFailuresWhenAbsent(t *testing.T) {
+	if got := Trend([]snapshot.Snapshot{base()}); strings.Contains(got, "## Failures") {
+		t.Errorf("failures section rendered for snapshots that have none:\n%s", got)
+	}
+}
+
 func TestNumFormatting(t *testing.T) {
 	cases := []struct {
 		in   float64

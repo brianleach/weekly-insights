@@ -181,6 +181,30 @@ Flags for `report`:
   `trend.html` into that directory
 - `--root DIR` usage-data directory
 
+### Failed tool calls
+
+`failures` classifies every failed tool call in the window. It pairs each errored
+`tool_result` back to the `tool_use` that produced it, so the tool name and, for
+Bash, the command are known at classification time.
+
+```
+weekly-insights failures --days 7
+weekly-insights failures --days 28 --end 2026-09-11 --json
+```
+
+Flags for `failures`: `--days N`, `--end YYYY-MM-DD`, `--json`, `--config FILE`,
+`--root DIR`, `--include-scratch`.
+
+The classes are a fixed, ordered set and the first match wins:
+`classifier_denied` (the permission classifier refused it), `hook_blocked` (a local
+PreToolUse hook did), `harness_rule` (a harness guardrail such as a sleep chain or
+an edit before a read), `api_flake` (5xx, rate limits, overload), `mcp_error` (by
+server), `shell_error` (by leading command, with known shell signatures named), and
+`other`. The report prints counts and per-session rates per class, the command
+shapes behind the classifier denials, the top 15 normalized signatures with one
+example command each, and the self-inflicted versus external split. `aggregate`
+stores the same totals in the snapshot, so `report --trend` can chart them.
+
 Snapshots record per-session rates (so a busy week is not penalised), the three
 friction types that generic extractors miss (`unverified_claim`,
 `unwanted_autonomous_action`, `ignored_stated_preference`), and every correction the
@@ -258,6 +282,9 @@ badly: in one real week they were 163 of 200. The builtin counts them.
   and message counts are the reliable volume signals. The builtin has the same
   distortion.
 - **Facets are judgments.** Only the counters from `session-meta` are exact.
+- **Self-inflicted versus external** is a classification by fixed rules over the
+  error text, not a judgment: a rule change moves the line, so compare weeks built
+  by the same version.
 
 ## License
 

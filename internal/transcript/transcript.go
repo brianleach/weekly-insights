@@ -143,31 +143,46 @@ func truncate(s string, n int) string {
 	return s
 }
 
-// Render reads a .jsonl transcript and returns the rendered text, or "" if the
-// session produced nothing renderable.
-func Render(path string, o Options) (string, error) {
-	o = o.withDefaults()
+// ForEachLine calls fn with every raw line of a .jsonl transcript, including
+// a partial final line.
+//
+// It exists so that every reader of a transcript in this repository shares one
+// line source. bufio.Scanner is not usable here: transcript lines routinely
+// carry whole tool payloads and exceed its 64KB token limit, and a silent
+// truncation there would drop exactly the largest, most interesting lines.
+func ForEachLine(path string, fn func(raw string)) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("opening transcript %s: %w", path, err)
+		return fmt.Errorf("opening transcript %s: %w", path, err)
 	}
 	defer f.Close()
 
-	var lines []string
 	r := bufio.NewReader(f)
 	for {
 		raw, err := r.ReadString('\n')
 		if raw != "" {
-			lines = append(lines, renderLine(raw, o)...)
+			fn(raw)
 		}
 		if err != nil {
 			// A transcript is appended to while the session runs, so the last
 			// line is routinely partial; io.EOF just ends the file.
 			if errors.Is(err, io.EOF) {
-				break
+				return nil
 			}
-			return "", fmt.Errorf("reading transcript %s: %w", path, err)
+			return fmt.Errorf("reading transcript %s: %w", path, err)
 		}
+	}
+}
+
+// Render reads a .jsonl transcript and returns the rendered text, or "" if the
+// session produced nothing renderable.
+func Render(path string, o Options) (string, error) {
+	o = o.withDefaults()
+	var lines []string
+	if err := ForEachLine(path, func(raw string) {
+		lines = append(lines, renderLine(raw, o)...)
+	}); err != nil {
+		return "", err
 	}
 	if len(lines) == 0 {
 		return "", nil
@@ -287,27 +302,11 @@ func Summarize(path string) (model.SessionMeta, error) {
 	m := model.SessionMeta{
 		SessionID: strings.TrimSuffix(filepath.Base(path), ".jsonl"),
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return model.SessionMeta{}, fmt.Errorf("opening transcript %s: %w", path, err)
-	}
-	defer f.Close()
-
 	var first, last time.Time
-	// Same reader as Render: transcript lines routinely exceed bufio.Scanner's
-	// 64KB token limit, so ReadString is the only safe line source here.
-	r := bufio.NewReader(f)
-	for {
-		raw, rerr := r.ReadString('\n')
-		if raw != "" {
-			summarizeLine(raw, &m, &first, &last)
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				break
-			}
-			return model.SessionMeta{}, fmt.Errorf("reading transcript %s: %w", path, rerr)
-		}
+	if err := ForEachLine(path, func(raw string) {
+		summarizeLine(raw, &m, &first, &last)
+	}); err != nil {
+		return model.SessionMeta{}, err
 	}
 	if !first.IsZero() && !last.IsZero() {
 		m.DurationMinutes = last.Sub(first).Minutes()

@@ -210,6 +210,22 @@ func Trend(snaps []snapshot.Snapshot) string {
 		))
 	}
 	line("")
+	// The failure block is additive and recent, so it renders only for the
+	// snapshots that carry it rather than printing "n/a" down the older rows.
+	if any := hasFailures(snaps); any {
+		line("## Failures")
+		line("")
+		for _, s := range snaps {
+			if s.Failures == nil {
+				continue
+			}
+			f := s.Failures
+			line(fmt.Sprintf("- %s: %d failures (%s/session), %d self-inflicted (%s/session), %d external",
+				s.Window.Label, f.Total, num(f.PerSession), f.SelfInflicted,
+				num(perSession(f.SelfInflicted, s.Sessions.Substantive)), f.External))
+		}
+		line("")
+	}
 	// Mixing facet sources is the one way this table lies, so the caveat ships
 	// with the table rather than living in the docs.
 	line("Rows built from normalized builtin facets are comparable to each other; " +
@@ -218,6 +234,24 @@ func Trend(snaps []snapshot.Snapshot) string {
 		"as a real change.")
 
 	return b.String()
+}
+
+// hasFailures reports whether any snapshot carries the additive failure block.
+func hasFailures(snaps []snapshot.Snapshot) bool {
+	for _, s := range snaps {
+		if s.Failures != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// perSession divides by a session count that may be zero in an empty window.
+func perSession(n, sessions int) float64 {
+	if sessions < 1 {
+		return 0
+	}
+	return round2(float64(n) / float64(sessions))
 }
 
 type kv struct {

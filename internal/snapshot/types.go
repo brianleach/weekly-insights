@@ -28,6 +28,24 @@ type Snapshot struct {
 	FrictionDetails     []FrictionDetail   `json:"friction_details"`
 	UserCorrections     []UserCorrection   `json:"user_corrections"`
 	Rates               map[string]float64 `json:"rates"`
+	// Failures is the classified tool-failure block, absent in snapshots
+	// written before the failures command existed. It is a pointer so that
+	// "this week had no failures" and "this week predates the counting" stay
+	// distinguishable in a trend line.
+	Failures *FailureSummary `json:"failures,omitempty"`
+}
+
+// FailureSummary is one window's failed tool calls, split by the fixed classes
+// in internal/failures. Only the totals live here; the per-incident detail is
+// reproducible from the transcripts and would bloat every snapshot.
+type FailureSummary struct {
+	Total      int            `json:"total"`
+	ByClass    map[string]int `json:"by_class"`
+	PerSession float64        `json:"per_session"`
+	// SelfInflicted counts failures a local rule could have prevented, and
+	// External the rest. They sum to Total.
+	SelfInflicted int `json:"self_inflicted"`
+	External      int `json:"external"`
 }
 
 // Window is the time range covered. Label is the end date, and together with

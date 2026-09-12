@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/brianleach/weekly-insights/internal/auth"
+	"github.com/brianleach/weekly-insights/internal/failures"
 	"github.com/brianleach/weekly-insights/internal/progress"
 	"github.com/brianleach/weekly-insights/internal/prompt"
 	"github.com/brianleach/weekly-insights/internal/report"
@@ -48,6 +49,7 @@ Commands:
   progress    judge progression across the last N weekly reports (separate file)
   auth        store the token insights needs (--check to verify, --clear to remove)
   select      show what is in the window and how many sessions need facets
+  failures    classify every failed tool call in the window (--json for the data)
   prepare     render the window's transcripts to text for facet extraction
   aggregate   build and save a snapshot of the window
   report      render the newest snapshot, diffed against the previous one
@@ -90,6 +92,8 @@ func main() {
 		err = cmdProgress(os.Args[2:])
 	case "select":
 		err = cmdSelect(os.Args[2:])
+	case "failures":
+		err = cmdFailures(os.Args[2:])
 	case "prepare":
 		err = cmdPrepare(os.Args[2:])
 	case "aggregate":
@@ -502,6 +506,35 @@ func cmdSelect(args []string) error {
 	return nil
 }
 
+// cmdFailures classifies every failed tool call in the window. It reads the
+// transcripts directly rather than the session-meta counters, because the
+// counters record how many tool errors happened and not what any of them was.
+func cmdFailures(args []string) error {
+	fs := flag.NewFlagSet("failures", flag.ExitOnError)
+	var cf commonFlags
+	cf.bind(fs)
+	asJSON := fs.Bool("json", false, "print the summary as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p, o, err := cf.resolve()
+	if err != nil {
+		return err
+	}
+	r, err := window.Select(p, o)
+	if err != nil {
+		return err
+	}
+	sum := failures.Summarize(failures.Collect(p, r.Substantive), len(r.Substantive))
+	if *asJSON {
+		return writeJSONTo(os.Stdout, sum)
+	}
+	label := fmt.Sprintf("%s .. %s  (%dd)",
+		r.Start.Format("2006-01-02"), r.End.Format("2006-01-02"), o.Days)
+	fmt.Print(failures.Report(sum, label))
+	return nil
+}
+
 func cmdPrepare(args []string) error {
 	fs := flag.NewFlagSet("prepare", flag.ExitOnError)
 	var cf commonFlags
@@ -574,6 +607,11 @@ func cmdAggregate(args []string) error {
 		collapses = map[string]map[string]bool{}
 	}
 	snap := snapshot.Build(r, o.Days, collapses)
+	// Failures are counted from the transcripts, which Build does not read, so
+	// the block is attached here. It is additive: a snapshot without it is
+	// still a valid snapshot.
+	snap.Failures = failures.SnapshotSummary(
+		failures.Summarize(failures.Collect(p, r.Substantive), len(r.Substantive)))
 
 	if *explain {
 		fmt.Fprintln(os.Stderr, "label normalization (canonical <- free-form seen this window):")
