@@ -432,3 +432,136 @@ func TestSummarizeMissingFile(t *testing.T) {
 		t.Fatal("expected an error for a missing transcript")
 	}
 }
+
+// A destination that cannot be tightened (here a symlink loop) must stop the
+// write rather than rewrite a file whose mode is unknown.
+func TestWriteForChmodFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks are not reliably creatable on windows")
+	}
+	p := claudeHome(t, "sess-6", `{"type":"user","message":{"content":"hello"}}`)
+	out := t.TempDir()
+	dest := filepath.Join(out, "sess-6.txt")
+	if err := os.Symlink("sess-6.txt", dest); err != nil {
+		t.Fatal(err)
+	}
+	err := WriteFor(p, "sess-6", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{})
+	if err == nil {
+		t.Fatal("expected an error when the destination cannot be chmodded")
+	}
+	if !strings.Contains(err.Error(), "tightening") {
+		t.Errorf("expected a tightening error, got %v", err)
+	}
+}
+
+func TestWriteForWriteFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks are not reliably creatable on windows")
+	}
+	p := claudeHome(t, "sess-7", `{"type":"user","message":{"content":"hello"}}`)
+	out := t.TempDir()
+	dest := filepath.Join(out, "sess-7.txt")
+	if err := os.Symlink(filepath.Join(out, "missing", "target.txt"), dest); err != nil {
+		t.Fatal(err)
+	}
+	err := WriteFor(p, "sess-7", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{})
+	if err == nil {
+		t.Fatal("expected an error when the destination cannot be written")
+	}
+	if !errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), "writing") {
+		t.Errorf("expected a writing error unwrapping to fs.ErrNotExist, got %v", err)
+	}
+}
+
+// A bracketed but malformed content field must yield nothing rather than a
+// partial or empty-but-allocated block list.
+func TestBlocksMalformedArray(t *testing.T) {
+	got := blocks([]byte(`[{"type":"text","text":"cut off"`))
+	if got != nil {
+		t.Errorf("got %#v, want nil for a malformed array", got)
+	}
+}
+
+// A non-object element in a content array is skipped without discarding the
+// blocks around it.
+func TestRenderSkipsNonObjectBlock(t *testing.T) {
+	got := render(t, Options{},
+		`{"type":"assistant","message":{"content":[`+
+			`{"type":"text","text":"before"},`+
+			`"stray",`+
+			`{"type":"tool_use","name":"Read"}]}}`)
+	want := "[Assistant]: before\n[Tool: Read]"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A user entry with no content field at all must neither fail nor emit a line.
+func TestRenderUserWithoutContent(t *testing.T) {
+	got := render(t, Options{},
+		`{"type":"user","message":{}}`,
+		`{"type":"user","message":{"content":"hi"}}`)
+	if got != "[User]: hi" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// A non-positive cap yields nothing rather than the whole string.
+func TestTruncateNonPositiveLimit(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		if got := truncate("héllo", n); got != "" {
+			t.Errorf("truncate(%q, %d) = %q, want empty", "héllo", n, got)
+		}
+	}
+}
+
+// Opening a directory succeeds on Linux but reading it fails, which is a read
+// error other than io.EOF and must surface rather than end the file quietly.
+func TestForEachLineReadError(t *testing.T) {
+	dir := t.TempDir()
+	var got []string
+	err := ForEachLine(dir, func(raw string) {
+		got = append(got, raw)
+	})
+	if err == nil {
+		t.Fatal("expected an error when the transcript cannot be read")
+	}
+	if !strings.Contains(err.Error(), dir) {
+		t.Errorf("error should name the transcript path, got %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected no lines from an unreadable transcript, got %q", got)
+	}
+}
+
+// A non-positive budget disables elision rather than cutting the body to nothing.
+func TestElideNonPositiveMaxKeepsBody(t *testing.T) {
+	body := strings.Repeat("a", 50)
+	for _, max := range []int{0, -4} {
+		if got := elide(body, max); got != body {
+			t.Errorf("elide(body, %d) = %q, want body unchanged", max, got)
+		}
+	}
+}
+
+// A transcript that can be located but not read must surface as a render
+// failure rather than a silently skipped session.
+func TestWriteForRenderError(t *testing.T) {
+	home := t.TempDir()
+	// A directory where the .jsonl should be opens fine but fails on read.
+	if err := os.MkdirAll(filepath.Join(home, "projects", "-tmp-fixture", "sess-6.jsonl"), 0o755); err != nil {
+		t.Fatalf("creating fixture: %v", err)
+	}
+	p := store.Paths{Root: filepath.Join(home, "usage-data"), ClaudeHome: home}
+	out := filepath.Join(t.TempDir(), "prepared")
+	err := WriteFor(p, "sess-6", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{})
+	if err == nil {
+		t.Fatal("expected an error when the transcript cannot be read")
+	}
+	if !strings.Contains(err.Error(), "rendering session sess-6") {
+		t.Errorf("error should name the session being rendered, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "sess-6.txt")); !os.IsNotExist(statErr) {
+		t.Errorf("expected no output file after a render failure, stat err = %v", statErr)
+	}
+}

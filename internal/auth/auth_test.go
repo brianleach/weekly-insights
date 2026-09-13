@@ -320,3 +320,190 @@ func TestClearPropagatesOtherExitCodes(t *testing.T) {
 		t.Error("Clear must propagate a non-not-found exit status")
 	}
 }
+
+func TestStoreReportsFileErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, p string)
+		want  string
+	}{
+		{"no config dir", func(t *testing.T, p string) {
+			t.Setenv("XDG_CONFIG_HOME", "")
+			t.Setenv("HOME", "")
+		}, "locating user config dir"},
+		{"parent is a file", func(t *testing.T, p string) {
+			if err := os.MkdirAll(filepath.Dir(filepath.Dir(p)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Dir(p), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, "creating"},
+		{"token path is a directory", func(t *testing.T, p string) {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, "writing token file"},
+		{"mode cannot be changed", func(t *testing.T, p string) {
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// procfs accepts the write but refuses chmod, even for root.
+			if err := os.Symlink("/proc/self/comm", p); err != nil {
+				t.Fatal(err)
+			}
+		}, "securing token file"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolate(t)
+			p, err := Path()
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, p)
+			src, err := Store(sample)
+			if err == nil {
+				t.Fatal("Store should fail")
+			}
+			if src != SourceNone {
+				t.Errorf("Store reported %q on failure, want none", src)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q lacks %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSetEchoFailsWithoutTerminal(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	old := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() { os.Stdin = old })
+
+	if err := setEcho(false); err == nil {
+		t.Error("setEcho(false) should fail when stdin is not a terminal")
+	}
+	if err := setEcho(true); err == nil {
+		t.Error("setEcho(true) should fail when stdin is not a terminal")
+	}
+}
+
+func TestPromptTokenDisablesAndRestoresEcho(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "stty.log")
+	script := "#!/bin/sh\necho \"$1\" >> '" + log + "'\n"
+	if err := os.WriteFile(filepath.Join(dir, "stty"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(sample+"\n"), &out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+	if strings.Contains(out.String(), "Could not disable terminal echo") {
+		t.Errorf("unexpected echo warning in %q", out.String())
+	}
+	if !strings.HasSuffix(out.String(), "Token: \n") {
+		t.Errorf("expected a newline after the silent read, got %q", out.String())
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "-echo\necho\n" {
+		t.Errorf("stty calls = %q, want echo disabled then restored", string(b))
+	}
+}
+
+func TestPromptTokenWarnsWhenEchoCannotBeDisabled(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "stty"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(sample+"\n"), &out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+	if !strings.Contains(out.String(), "Could not disable terminal echo") {
+		t.Errorf("echo warning missing from %q", out.String())
+	}
+	if strings.HasSuffix(out.String(), "Token: \n") {
+		t.Errorf("no extra newline expected when echo stayed on, got %q", out.String())
+	}
+}
+
+func TestRunSecurityInvokesSecurityCLI(t *testing.T) {
+	// An empty PATH guarantees no real `security` binary (and so no real
+	// keychain) is ever reached, on any platform.
+	t.Setenv("PATH", t.TempDir())
+	out, err := runSecurity("find-generic-password", "-s", KeychainService, "-w")
+	if err == nil {
+		t.Fatalf("expected lookup failure with empty PATH, got output %q", out)
+	}
+	var ee *exec.Error
+	if !errors.As(err, &ee) {
+		t.Fatalf("expected *exec.Error, got %T: %v", err, err)
+	}
+	if ee.Name != "security" {
+		t.Errorf("runSecurity ran %q, want the security CLI", ee.Name)
+	}
+	if !errors.Is(err, exec.ErrNotFound) {
+		t.Errorf("expected exec.ErrNotFound, got %v", err)
+	}
+}
+
+func TestResolveWithoutConfigDir(t *testing.T) {
+	isolate(t)
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("AppData", "")
+	if _, err := Path(); err == nil {
+		t.Fatal("Path should fail when no user config dir can be located")
+	}
+	if tok, src := Resolve(); tok != "" || src != SourceNone {
+		t.Errorf("Resolve = %q from %q; want nothing when the config dir is unknown", tok, src)
+	}
+}
+
+func TestResolveWhitespaceOnlyFile(t *testing.T) {
+	isolate(t)
+	p, _ := Path()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("  \n\t\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if tok, src := Resolve(); tok != "" || src != SourceNone {
+		t.Errorf("blank token file must resolve to nothing, got %q from %q", tok, src)
+	}
+}
+
+func TestResolveFallsBackToFileWhenKeychainFails(t *testing.T) {
+	isolate(t)
+	if _, err := Store(sample); err != nil {
+		t.Fatal(err)
+	}
+	stubKeychain(t, func(args ...string) ([]byte, error) {
+		return []byte("security: The specified item could not be found in the keychain."), errors.New("exit status 44")
+	})
+	tok, src := Resolve()
+	if tok != sample || src != SourceFile {
+		t.Errorf("Resolve = %q from %q; want the file token when the keychain lookup fails", tok, src)
+	}
+}

@@ -514,3 +514,115 @@ func TestSnapshotWithoutFailuresStillLoads(t *testing.T) {
 		t.Fatalf("absent block was written back: %s", b)
 	}
 }
+
+func TestDecodeBlocksRejectsNonArrayAndMalformedContent(t *testing.T) {
+	// Content that is not array-form, even if JSON would accept it as one
+	// after leading whitespace, is not block content.
+	if got := decodeBlocks(json.RawMessage(` [{"type":"text","text":"x"}]`)); got != nil {
+		t.Fatalf("decodeBlocks(non-array) = %+v, want nil", got)
+	}
+	// A truncated array cannot be decoded at all.
+	if got := decodeBlocks(json.RawMessage(`[{"type":"text"},`)); got != nil {
+		t.Fatalf("decodeBlocks(malformed) = %+v, want nil", got)
+	}
+}
+
+// A transcript that exists but cannot be read is skipped the same way a
+// missing one is, and the sessions after it are still counted.
+func TestCollectSkipsUnreadableTranscripts(t *testing.T) {
+	root := t.TempDir()
+	p := store.Paths{Root: root, ClaudeHome: filepath.Join(root, "claude")}
+	dir := filepath.Join(p.Transcripts(), "-tmp-project")
+	// A directory where the transcript file should be opens but fails to read.
+	if err := os.MkdirAll(filepath.Join(dir, "broken.jsonl"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := strings.Join([]string{
+		toolUse("a", "Bash", "go build"),
+		toolResult("a", "Exit code 2\nbroken", true),
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "good-one.jsonl"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if p.TranscriptPath("broken") == "" {
+		t.Fatalf("expected a path for the unreadable transcript")
+	}
+	sessions := []model.Session{
+		{Meta: model.SessionMeta{SessionID: "broken", StartTime: "2026-09-10T08:00:00Z"}},
+		{Meta: model.SessionMeta{SessionID: "good-one", StartTime: "2026-09-11T09:00:00Z", ProjectPath: "/tmp/project"}},
+	}
+	fs := Collect(p, sessions)
+	if len(fs) != 1 || fs[0].Session != "good-one" || fs[0].Class != ClassShellError || fs[0].Date != "2026-09-11" {
+		t.Fatalf("collected %+v", fs)
+	}
+}
+
+// Blank and whitespace-only lines appear between entries when a writer flushes
+// a bare newline; they must be skipped without disturbing pairing.
+func TestScanSkipsBlankLines(t *testing.T) {
+	fs := scan(t,
+		"",
+		toolUse("t1", "Bash", "ls /nope"),
+		"   \t  ",
+		"",
+		toolResult("t1", "Exit code 1\nNo such file or directory", true),
+	)
+	if len(fs) != 1 || fs[0].Command != "ls /nope" || fs[0].Class != ClassShellError {
+		t.Fatalf("got %+v", fs)
+	}
+}
+
+// One malformed element must be dropped on its own without losing its
+// siblings. The bad element here is a partial decode: a type mismatch on one
+// field still fills the others, so keeping it would count a phantom failure.
+func TestScanSkipsMalformedContentElement(t *testing.T) {
+	bad := `{"type":"user","message":{"content":[` +
+		`{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nphantom","text":5},` +
+		`{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nreal"}` +
+		`]}}`
+	fs := scan(t, toolUse("t1", "Bash", "ls"), bad)
+	if len(fs) != 1 || !strings.Contains(fs[0].Signature, "real") {
+		t.Fatalf("got %+v", fs)
+	}
+}
+
+// A tool_result with no content field but a top-level text field still
+// carries its error message into classification.
+func TestScanReadsTextFieldWhenContentMissing(t *testing.T) {
+	b, _ := json.Marshal(map[string]any{
+		"type": "user",
+		"message": map[string]any{"content": []any{map[string]any{
+			"type": "tool_result", "tool_use_id": "t1", "is_error": true, "text": denialText,
+		}}},
+	})
+	fs := scan(t, toolUse("t1", "Bash", "cat .env"), string(b))
+	if len(fs) != 1 || fs[0].Class != ClassClassifierDenied || fs[0].Detail != "Credential Leakage" {
+		t.Fatalf("got %+v", fs)
+	}
+	if fs[0].Signature != Normalize(denialText) {
+		t.Fatalf("signature = %q, want %q", fs[0].Signature, Normalize(denialText))
+	}
+}
+
+// Malformed string-form content yields no text rather than the raw bytes or
+// the block's text field, so a corrupt result never leaks into a signature.
+func TestResultTextMalformedStringContent(t *testing.T) {
+	b := block{Content: json.RawMessage(`"unterminated`), Text: "fallback"}
+	if got := resultText(b); got != "" {
+		t.Fatalf("resultText = %q, want empty", got)
+	}
+}
+
+// Only an object-form input is decoded. Anything else, including an input
+// that is not a JSON object at its first byte, yields no command.
+func TestBashCommandIgnoresNonObjectInput(t *testing.T) {
+	cases := []string{"", `"ls -la"`, ` {"command":"ls -la"}`}
+	for _, in := range cases {
+		if got := bashCommand(json.RawMessage(in)); got != "" {
+			t.Fatalf("bashCommand(%q) = %q, want empty", in, got)
+		}
+	}
+	if got := bashCommand(json.RawMessage(`{"command":"ls -la"}`)); got != "ls -la" {
+		t.Fatalf("bashCommand(object) = %q, want %q", got, "ls -la")
+	}
+}

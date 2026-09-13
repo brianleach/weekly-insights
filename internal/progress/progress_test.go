@@ -242,3 +242,73 @@ func TestRunDetectsNotLoggedIn(t *testing.T) {
 		t.Errorf("expected runner.ErrNotLoggedIn, got %v", err)
 	}
 }
+
+func TestRenderListsResolvedThemes(t *testing.T) {
+	m := Memo{
+		Verdict:   "Better",
+		Resolved:  []Resolved{{Theme: "Missing <links>", LastSeen: "2026-08-28", Note: "gone & stayed gone"}},
+		OneChange: "c",
+	}
+	got := Render(m, "", oneWeek(t))
+	want := `<div class="big-wins">
+<div class="big-win"><div class="big-win-title">Missing &lt;links&gt; <span class="muted">last seen Aug 28</span></div><div class="big-win-desc">gone &amp; stayed gone</div></div>
+</div>
+`
+	if !strings.Contains(got, want) {
+		t.Errorf("resolved section not rendered as expected:\n%s", got)
+	}
+	if strings.Contains(got, "No earlier theme has disappeared yet.") {
+		t.Error("empty placeholder shown despite resolved themes")
+	}
+}
+
+func TestRenderShowsAlreadyHaveAndNumbers(t *testing.T) {
+	m := Memo{
+		Verdict:     "Better",
+		AlreadyHave: []string{"Link PRs & issues", "Verify <first>"},
+		Numbers:     "Friction fell from 3 to 1 per session",
+		OneChange:   "Add a hook",
+	}
+	got := Render(m, "", oneWeek(t))
+	for _, want := range []string{
+		"<h2>Still Being Suggested, Already In Place</h2>",
+		"<li>Link PRs &amp; issues</li>\n<li>Verify &lt;first&gt;</li>\n</ul>",
+		`<h2>Numbers</h2>`,
+		`<div class="narrative"><p>Friction fell from 3 to 1 per session</p></div>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render missing %q", want)
+		}
+	}
+	blank := Render(Memo{Verdict: "Better", Numbers: "   ", OneChange: "x"}, "", oneWeek(t))
+	if strings.Contains(blank, "<h2>Numbers</h2>") || strings.Contains(blank, "Already In Place") {
+		t.Error("empty numbers and already_have must not render their sections")
+	}
+}
+
+func TestInstructionsReturnsEmbeddedPrompt(t *testing.T) {
+	want, err := os.ReadFile("prompt.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Instructions()
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("instructions are empty")
+	}
+	if got != string(want) {
+		t.Errorf("instructions do not match prompt.md:\n%q", got)
+	}
+}
+
+func TestInputTextOmitsEmptySections(t *testing.T) {
+	in := Input{Weeks: []Week{{Label: "2026-09-11", Days: 7}}}
+	txt := in.Text()
+	if !strings.Contains(txt, "WEEK ENDING 2026-09-11 (7 days)") {
+		t.Errorf("input text missing week header: %q", txt)
+	}
+	for _, unwanted := range []string{"At a glance:", "Features suggested:", "Horizon ideas:"} {
+		if strings.Contains(txt, unwanted) {
+			t.Errorf("empty section %q must be omitted, got %q", unwanted, txt)
+		}
+	}
+}

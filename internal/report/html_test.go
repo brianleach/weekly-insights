@@ -115,3 +115,86 @@ func TestTrendHTMLEmpty(t *testing.T) {
 		t.Error("empty trend should say so rather than render an empty grid")
 	}
 }
+
+func TestWeeklyHTMLFootnoteSummarisesFacetSources(t *testing.T) {
+	cur := base()
+	cur.Sessions.FacetSource = map[string]int{"builtin": 2, "canonical": 3, "other": 9}
+	got := WeeklyHTML(cur, nil)
+	if !strings.Contains(got, "Facets: 3 canonical, 2 builtin.") {
+		t.Error("expected facet sources listed canonical first, then builtin, ignoring unknown sources")
+	}
+}
+
+func TestWeeklyHTMLSkipsMetricsMissingFromBothWeeks(t *testing.T) {
+	cur, prev := base(), base()
+	cur.Rates, prev.Rates = nil, nil
+	got := WeeklyHTML(cur, &prev)
+
+	if !strings.Contains(got, `class="delta-grid"`) {
+		t.Fatal("expected the delta grid when a prior week exists")
+	}
+	if n := strings.Count(got, `class="delta-card`); n != 0 {
+		t.Errorf("metrics absent from both weeks must not get a delta card, got %d", n)
+	}
+}
+
+func TestHumanizeEmptyLabel(t *testing.T) {
+	if got := humanize(""); got != "" {
+		t.Errorf("humanize(\"\") = %q, want empty string", got)
+	}
+	if got := humanize("fix_bug"); got != "Fix bug" {
+		t.Errorf("humanize(\"fix_bug\") = %q, want %q", got, "Fix bug")
+	}
+}
+
+func TestLongDateFallsBackToEscapedInputWhenUnparseable(t *testing.T) {
+	if got := longDate("<unknown>"); got != "&lt;unknown&gt;" {
+		t.Errorf("expected escaped raw input, got %q", got)
+	}
+}
+
+func TestTrendHTMLEscapesUnparseableWeekLabel(t *testing.T) {
+	a := base()
+	a.Window.Label = "<bad>"
+	got := TrendHTML([]snapshot.Snapshot{a})
+
+	if !strings.Contains(got, `<div class="bar-label">&lt;bad&gt;</div>`) {
+		t.Error("an unparseable week label should fall back to the escaped raw label")
+	}
+	if strings.Contains(got, "<bad>") {
+		t.Error("week label was not escaped")
+	}
+}
+
+func TestChartMarksBarDeltasAgainstLastWeek(t *testing.T) {
+	var b strings.Builder
+	chart(&b, "Goals", map[string]int{"fix_bug": 5, "docs": 3, "refactor": 2}, map[string]int{"fix_bug": 3, "refactor": 4}, 10, "#2563eb")
+	got := b.String()
+
+	for _, want := range []string{
+		`<div class="bar-value">5 <span class="bar-delta up">+2</span></div>`,
+		`<div class="bar-value">3 <span class="bar-delta new">new</span></div>`,
+		`<div class="bar-value">2 <span class="bar-delta down">-2</span></div>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %s", want, got)
+		}
+	}
+}
+
+func TestShortProjectsKeepsLastTwoSegmentsAndMerges(t *testing.T) {
+	got := shortProjects(map[string]int{
+		"/home/bleach/code/insights": 3,
+		"/srv/work/code/insights/":   2,
+		"solo":                       1,
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 projects, got %d: %v", len(got), got)
+	}
+	if got["code/insights"] != 5 {
+		t.Errorf("expected code/insights to merge to 5, got %v", got)
+	}
+	if got["solo"] != 1 {
+		t.Errorf("expected short path kept as is, got %v", got)
+	}
+}
