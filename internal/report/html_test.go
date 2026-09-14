@@ -115,3 +115,92 @@ func TestTrendHTMLEmpty(t *testing.T) {
 		t.Error("empty trend should say so rather than render an empty grid")
 	}
 }
+
+func TestWeeklyHTMLFootnoteSummarisesFacetSources(t *testing.T) {
+	cur := base()
+	cur.Sessions.FacetSource = map[string]int{"builtin": 2, "canonical": 3}
+	got := WeeklyHTML(cur, nil)
+	if !strings.Contains(got, "Facets: 3 canonical, 2 builtin.") {
+		t.Error("expected facet sources listed canonical first, then builtin")
+	}
+}
+
+func TestWeeklyHTMLSkipsMetricsMissingFromBothWeeks(t *testing.T) {
+	cur, prev := base(), base()
+	cur.Rates, prev.Rates = nil, nil
+	got := WeeklyHTML(cur, &prev)
+
+	if !strings.Contains(got, `class="delta-grid"`) {
+		t.Fatal("expected the delta grid when a prior week exists")
+	}
+	if n := strings.Count(got, `class="delta-card`); n != 0 {
+		t.Errorf("metrics absent from both weeks must be skipped, got %d delta cards", n)
+	}
+}
+
+func TestHumanizeEmptyLabel(t *testing.T) {
+	if got := humanize(""); got != "" {
+		t.Errorf("humanize(\"\") = %q, want empty string", got)
+	}
+}
+
+func TestWeeklyHTMLEscapesUnparseableWindowDate(t *testing.T) {
+	cur := base()
+	cur.Window.Start = "<soon>"
+	got := WeeklyHTML(cur, nil)
+
+	if strings.Contains(got, "<soon>") {
+		t.Error("unparseable date was not escaped")
+	}
+	if !strings.Contains(got, `<div class="subtitle">&lt;soon&gt; to `) {
+		t.Error("expected the unparseable start date to fall back to its escaped raw text")
+	}
+}
+
+func TestTrendHTMLEscapesUnparseableWeekLabel(t *testing.T) {
+	a := base()
+	a.Window.Label = "not a <date> label"
+	got := TrendHTML([]snapshot.Snapshot{a})
+
+	if !strings.Contains(got, `<div class="bar-label">not a &lt;date&gt; label</div>`) {
+		t.Error("unparseable week label should be shown escaped as the bar label")
+	}
+	if strings.Contains(got, "<date>") {
+		t.Error("week label was not escaped")
+	}
+}
+
+func TestChartMarksBarDeltasAgainstLastWeek(t *testing.T) {
+	var b strings.Builder
+	cur := map[string]int{"fix_bug": 5, "refactor": 2, "write_docs": 3}
+	prev := map[string]int{"fix_bug": 3, "refactor": 4}
+	chart(&b, "Goals", cur, prev, 10, "#2563eb")
+	got := b.String()
+
+	for _, want := range []string{
+		`<div class="bar-value">5 <span class="bar-delta up">+2</span></div>`,
+		`<div class="bar-value">2 <span class="bar-delta down">-2</span></div>`,
+		`<div class="bar-value">3 <span class="bar-delta new">new</span></div>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %s", want, got)
+		}
+	}
+}
+
+func TestShortProjectsKeepsLastTwoSegmentsAndMerges(t *testing.T) {
+	got := shortProjects(map[string]int{
+		"/home/me/code/weekly-insights/": 3,
+		"/work/code/weekly-insights":     2,
+		"tools":                          1,
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 projects after shortening, got %v", got)
+	}
+	if got["code/weekly-insights"] != 5 {
+		t.Errorf("expected long paths trimmed to their last two segments and merged to 5, got %v", got)
+	}
+	if got["tools"] != 1 {
+		t.Errorf("expected short path kept as is, got %v", got)
+	}
+}

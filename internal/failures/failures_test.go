@@ -514,3 +514,127 @@ func TestSnapshotWithoutFailuresStillLoads(t *testing.T) {
 		t.Fatalf("absent block was written back: %s", b)
 	}
 }
+
+// Content that is not an array, or an array that does not parse, yields no
+// blocks rather than a panic or a partial decode.
+func TestDecodeBlocksRejectsNonArrayAndMalformedContent(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"empty", nil},
+		{"string content", json.RawMessage(`"plain text prompt"`)},
+		{"object content", json.RawMessage(`{"type":"tool_result","is_error":true}`)},
+		{"truncated array", json.RawMessage(`[{"type":"tool_result","is_error":true},`)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := decodeBlocks(c.raw); got != nil {
+				t.Fatalf("decodeBlocks(%s) = %+v, want nil", c.raw, got)
+			}
+		})
+	}
+}
+
+// A transcript that exists but cannot be read must be skipped too, and must
+// not stop the sessions after it from being counted.
+func TestCollectSkipsUnreadableTranscripts(t *testing.T) {
+	root := t.TempDir()
+	p := store.Paths{Root: root, ClaudeHome: filepath.Join(root, "claude")}
+	dir := filepath.Join(p.Transcripts(), "-tmp-project")
+	// A directory where the transcript file should be resolves to a path but
+	// fails on read.
+	if err := os.MkdirAll(filepath.Join(dir, "broken.jsonl"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := strings.Join([]string{
+		toolUse("a", "Bash", "cat .env"),
+		toolResult("a", denialText, true),
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "good-one.jsonl"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	sessions := []model.Session{
+		{Meta: model.SessionMeta{SessionID: "broken", StartTime: "2026-09-10T08:00:00Z"}},
+		{Meta: model.SessionMeta{SessionID: "good-one", StartTime: "2026-09-10T09:00:00Z", ProjectPath: "/tmp/project"}},
+	}
+	fs := Collect(p, sessions)
+	if len(fs) != 1 || fs[0].Session != "good-one" || fs[0].Class != ClassClassifierDenied {
+		t.Fatalf("collected %+v", fs)
+	}
+}
+
+// Blank and whitespace-only lines appear between entries when a writer flushes
+// padding; they must be skipped without dropping the entries around them.
+func TestScanSkipsBlankLines(t *testing.T) {
+	fs := scan(t,
+		"",
+		toolUse("t1", "Bash", "ls /nope"),
+		"   \t",
+		toolResult("t1", "Exit code 1\nNo such file or directory", true),
+		"",
+	)
+	if len(fs) != 1 || fs[0].Command != "ls /nope" || fs[0].Class != ClassShellError {
+		t.Fatalf("got %+v", fs)
+	}
+}
+
+// One malformed element in a content array must not drop its siblings, and must
+// not itself be counted even when enough of it decoded to look like a failure.
+func TestScanSkipsMalformedContentBlock(t *testing.T) {
+	fs := scan(t,
+		toolUse("t1", "Bash", "ls /nope"),
+		`{"type":"user","message":{"content":[`+
+			`{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nbad block","name":7},`+
+			`{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nNo such file or directory"}`+
+			`]}}`,
+	)
+	if len(fs) != 1 {
+		t.Fatalf("got %d failures, want 1: %+v", len(fs), fs)
+	}
+	if fs[0].ShellSignature != "no_such_file" || strings.Contains(fs[0].Signature, "bad block") {
+		t.Fatalf("got %+v", fs[0])
+	}
+}
+
+// A tool_result with no content field falls back to its text field, so the
+// message is still classified and normalized rather than read as empty.
+func TestScanReadsTextFieldWhenContentMissing(t *testing.T) {
+	fs := scan(t,
+		toolUse("t1", "mcp__linear__save_issue", ""),
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"text":"input validation failed for field title"}]}}`,
+	)
+	if len(fs) != 1 {
+		t.Fatalf("got %d failures, want 1", len(fs))
+	}
+	if fs[0].Signature != "input validation failed for field title" || fs[0].Class != ClassMCPError {
+		t.Fatalf("got %+v", fs[0])
+	}
+}
+
+// A string-form content field that is not valid JSON yields no text rather
+// than the raw bytes, so a corrupt result never leaks into a signature.
+func TestResultTextMalformedStringContent(t *testing.T) {
+	b := block{Content: json.RawMessage(`"unterminated \x`), Text: "fallback"}
+	if got := resultText(b); got != "" {
+		t.Fatalf("resultText = %q, want empty", got)
+	}
+}
+
+// A tool_use whose input is not a JSON object carries no command, so the
+// failure is still counted but has no command or shape to report.
+func TestScanNonObjectInputHasNoCommand(t *testing.T) {
+	b, _ := json.Marshal(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{"content": []any{map[string]any{
+			"type": "tool_use", "id": "t1", "name": "Bash", "input": "cat .env",
+		}}},
+	})
+	fs := scan(t, string(b), toolResult("t1", denialText, true))
+	if len(fs) != 1 || fs[0].Tool != "Bash" {
+		t.Fatalf("got %+v", fs)
+	}
+	if fs[0].Command != "" || fs[0].Shape != "" || fs[0].SelfInflicted {
+		t.Fatalf("non-object input produced a command: %+v", fs[0])
+	}
+}

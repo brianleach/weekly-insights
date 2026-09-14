@@ -320,3 +320,210 @@ func TestClearPropagatesOtherExitCodes(t *testing.T) {
 		t.Error("Clear must propagate a non-not-found exit status")
 	}
 }
+
+func TestStoreReportsFileErrors(t *testing.T) {
+	home := isolate(t)
+	p, _ := Path()
+	configDir := filepath.Dir(filepath.Dir(p))
+
+	// A regular file where the config directory should be.
+	if err := os.WriteFile(configDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src, err := Store(sample)
+	if err == nil || src != SourceNone || !strings.Contains(err.Error(), "creating") {
+		t.Errorf("Store with a blocked config dir = %q, %v; want a creating error", src, err)
+	}
+	if err := os.Remove(configDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// A directory where the token file should be.
+	if err := os.MkdirAll(p, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	src, err = Store(sample)
+	if err == nil || src != SourceNone || !strings.Contains(err.Error(), "writing token file") {
+		t.Errorf("Store with a directory at the token path = %q, %v; want a write error", src, err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+
+	if runtime.GOOS == "linux" {
+		// procfs accepts the write but refuses a mode change, even for root.
+		old, err := os.ReadFile("/proc/self/comm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.WriteFile("/proc/self/comm", old, 0o600) })
+		if err := os.Symlink("/proc/self/comm", p); err != nil {
+			t.Fatal(err)
+		}
+		src, err = Store(sample)
+		if err == nil || src != SourceNone || !strings.Contains(err.Error(), "securing token file") {
+			t.Errorf("Store with an unchmoddable token file = %q, %v; want a securing error", src, err)
+		}
+	}
+
+	// No way to locate the user config dir at all.
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("AppData", "")
+	src, err = Store(sample)
+	if err == nil || src != SourceNone {
+		t.Errorf("Store without a config dir = %q, %v; want an error", src, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "weekly-insights")); !os.IsNotExist(statErr) {
+		t.Errorf("Store wrote a token despite failing to locate the config dir")
+	}
+}
+
+func TestPromptTokenTogglesEchoOnTerminal(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "stty.log")
+	script := `#!/bin/sh
+echo "$1 $(readlink /proc/$$/fd/0)" >> "$STTY_LOG"
+`
+	if err := os.WriteFile(filepath.Join(dir, "stty"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STTY_LOG", logPath)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	stdinPath := filepath.Join(dir, "stdin")
+	if err := os.WriteFile(stdinPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(stdinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		f.Close()
+	})
+
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(sample+"\n"), &out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+	if strings.Contains(out.String(), "Could not disable terminal echo") {
+		t.Errorf("echo toggle reported failure: %q", out.String())
+	}
+
+	real, err := filepath.EvalSymlinks(stdinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "-echo " + real + "\necho " + real + "\n"
+	if string(b) != want {
+		t.Errorf("stty calls = %q, want %q", string(b), want)
+	}
+}
+
+func TestPromptTokenDisablesAndRestoresEcho(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "stty.log")
+	script := "#!/bin/sh\necho \"$1\" >> " + log + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "stty"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(sample+"\n"), &out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+	if strings.Contains(out.String(), "Could not disable terminal echo") {
+		t.Errorf("unexpected echo warning in %q", out.String())
+	}
+	if !strings.HasSuffix(out.String(), "Token: \n") {
+		t.Errorf("expected a newline after the silent read, got %q", out.String())
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "-echo\necho\n" {
+		t.Errorf("stty calls = %q, want echo disabled then restored", string(b))
+	}
+}
+
+func TestPromptTokenWarnsWhenEchoCannotBeDisabled(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "stty"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	var out strings.Builder
+	tok, err := PromptToken(strings.NewReader(sample+"\n"), &out, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != sample {
+		t.Errorf("PromptToken = %q, want %q", tok, sample)
+	}
+	if !strings.Contains(out.String(), "Could not disable terminal echo") {
+		t.Errorf("echo warning missing from %q", out.String())
+	}
+	if strings.HasSuffix(out.String(), "Token: \n") {
+		t.Errorf("no extra newline expected when echo stayed on, got %q", out.String())
+	}
+}
+
+func TestRunSecurityInvokesSecurityOnPath(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "security"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runSecurity("find-generic-password", "-s", KeychainService, "-w")
+	if err != nil {
+		t.Fatalf("runSecurity: %v: %s", err, out)
+	}
+	if got, want := strings.TrimSpace(string(out)), "find-generic-password -s "+KeychainService+" -w"; got != want {
+		t.Errorf("security received %q, want %q", got, want)
+	}
+}
+
+func TestResolveWithoutConfigDir(t *testing.T) {
+	isolate(t)
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("AppData", "")
+	if _, err := Path(); err == nil {
+		t.Fatal("expected Path to fail with no config dir")
+	}
+	if tok, src := Resolve(); tok != "" || src != SourceNone {
+		t.Errorf("Resolve = %q from %q; want nothing when the config dir is unknown", tok, src)
+	}
+}
+
+func TestResolveIgnoresBlankFile(t *testing.T) {
+	isolate(t)
+	p, _ := Path()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if tok, src := Resolve(); tok != "" || src != SourceNone {
+		t.Errorf("blank token file resolved to %q from %q", tok, src)
+	}
+}

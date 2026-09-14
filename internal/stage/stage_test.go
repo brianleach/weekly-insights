@@ -246,3 +246,185 @@ func TestCopyDirPermissions(t *testing.T) {
 		t.Errorf("copied file mode = %o, want 0600, source mode must not carry over", got)
 	}
 }
+
+func TestStageTranscriptErrorsAndMissing(t *testing.T) {
+	p, _ := fakeHome(t)
+	dst := t.TempDir()
+	sp := store.Paths{Root: filepath.Join(dst, "usage-data"), ClaudeHome: dst}
+
+	// No transcript anywhere for this id: nothing is staged and it is not an error.
+	var c Counts
+	if err := stageTranscript(p, sp, "missing", &c); err != nil {
+		t.Errorf("a session without a transcript should be skipped, got %v", err)
+	}
+	if c.Transcripts != 0 {
+		t.Errorf("transcripts = %d, want 0 for a missing transcript", c.Transcripts)
+	}
+
+	// A transcript already present in the stage cannot be copied over.
+	if err := stageTranscript(p, sp, "bbb", &c); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageTranscript(p, sp, "bbb", &c); err == nil {
+		t.Error("expected an error copying a transcript onto an existing file")
+	}
+	if c.Transcripts != 1 {
+		t.Errorf("transcripts = %d, want 1 after a failed second copy", c.Transcripts)
+	}
+
+	// The stage's projects location is blocked by a regular file.
+	blocked := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bad := store.Paths{Root: filepath.Join(blocked, "usage-data"), ClaudeHome: blocked}
+	var c2 Counts
+	if err := stageTranscript(p, bad, "aaa", &c2); err == nil {
+		t.Error("expected an error creating the project dir under a regular file")
+	}
+	if c2.Transcripts != 0 {
+		t.Errorf("transcripts = %d, want 0 when the project dir cannot be created", c2.Transcripts)
+	}
+}
+
+// A source that opens but cannot be read must surface the read failure, not
+// whatever closing the half-written destination happens to report.
+func TestCopyFileReportsReadFailure(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+	err := copyFile(src, dst, 0o600)
+	if err == nil {
+		t.Fatal("expected an error copying from a directory")
+	}
+	if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+		t.Errorf("copy error was masked by a close error: %v", err)
+	}
+}
+
+func TestEnsureEmptyDirReportsCreateAndReadFailures(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureEmptyDir(filepath.Join(file, "stage"))
+	if err == nil {
+		t.Fatal("expected an error when the stage cannot be created")
+	}
+	if got := err.Error(); len(got) < len("creating stage") || got[:len("creating stage")] != "creating stage" {
+		t.Errorf("error = %q, want a creating stage failure", got)
+	}
+
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		return
+	}
+	unreadable := filepath.Join(t.TempDir(), "unreadable")
+	if err := os.Mkdir(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(unreadable, 0o700) })
+	err = ensureEmptyDir(unreadable)
+	if err == nil {
+		t.Fatal("expected an error when the stage cannot be read")
+	}
+	if got := err.Error(); len(got) < len("reading stage") || got[:len("reading stage")] != "reading stage" {
+		t.Errorf("error = %q, want a reading stage failure", got)
+	}
+}
+
+func TestBuildFailsWhenConfigDirUnreadable(t *testing.T) {
+	p, home := fakeHome(t)
+	p.ClaudeHome = filepath.Join(t.TempDir(), "missing")
+	dst := filepath.Join(t.TempDir(), "stage")
+	c, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, nil, dst)
+	if err == nil {
+		t.Fatal("expected an error when the real config dir cannot be read")
+	}
+	if c != (Counts{}) {
+		t.Errorf("counts = %+v, want zero", c)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, ".claude.json")); !os.IsNotExist(err) {
+		t.Errorf("account file should not be staged after config sharing fails, stat err = %v", err)
+	}
+}
+
+// An account file that exists but cannot be read is a real failure, unlike a
+// missing one, and must stop the build rather than stage a child with no login.
+func TestBuildFailsOnUnreadableAccountFile(t *testing.T) {
+	p, _ := fakeHome(t)
+	dst := filepath.Join(t.TempDir(), "stage")
+	// A directory opens fine but cannot be copied as a file.
+	if _, err := Build(Inputs{Paths: p, AccountFile: t.TempDir()}, nil, dst); err == nil {
+		t.Error("expected an error when the account file cannot be copied")
+	}
+}
+
+// A credentials path that exists but cannot be copied is a real failure, unlike
+// an absent one, and must stop the build rather than stage a logged-out child.
+func TestBuildFailsOnUnreadableCredentials(t *testing.T) {
+	p, home := fakeHome(t)
+	cred := filepath.Join(p.ClaudeHome, ".credentials.json")
+	if err := os.Remove(cred); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cred, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "stage")
+	if _, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, nil, dst); err == nil {
+		t.Error("expected an error when the credentials file cannot be copied")
+	}
+}
+
+func TestBuildReportsStageSubdirCreationFailure(t *testing.T) {
+	home := t.TempDir()
+	p := store.Paths{Root: filepath.Join(home, "usage-data"), ClaudeHome: home}
+	// A stage path just under PATH_MAX can itself be created, but the owned
+	// subdirectories beneath it cannot.
+	dst := t.TempDir()
+	for 4090-len(dst) > 255 {
+		name := make([]byte, 200)
+		for i := range name {
+			name[i] = 'a'
+		}
+		dst += string(os.PathSeparator) + string(name)
+	}
+	name := make([]byte, 4090-len(dst)-1)
+	for i := range name {
+		name[i] = 'b'
+	}
+	dst += string(os.PathSeparator) + string(name)
+
+	c, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(home, "nope.json")}, nil, dst)
+	if fi, statErr := os.Stat(dst); statErr != nil || !fi.IsDir() {
+		t.Fatalf("stage root should have been created: %v", statErr)
+	}
+	if err == nil {
+		t.Fatal("expected an error when the stage subdirectories cannot be created")
+	}
+	if c != (Counts{}) {
+		t.Errorf("counts = %+v, want none staged", c)
+	}
+}
+
+// Staging the same session twice must fail on the transcript copy rather than
+// silently overwrite what is already in the stage.
+func TestBuildFailsWhenTranscriptCannotBeStaged(t *testing.T) {
+	p, home := fakeHome(t)
+	// ccc has only a transcript, so nothing after the transcript step could fail.
+	proj := filepath.Join(p.ClaudeHome, "projects", "-Users-me-code")
+	if err := os.WriteFile(filepath.Join(proj, "ccc.jsonl"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "stage")
+	sessions := []model.Session{
+		{Meta: model.SessionMeta{SessionID: "ccc"}},
+		{Meta: model.SessionMeta{SessionID: "ccc"}},
+	}
+	c, err := Build(Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, sessions, dst)
+	if err == nil {
+		t.Fatal("expected an error when the transcript already exists in the stage")
+	}
+	if c != (Counts{Sessions: 2, Transcripts: 1}) {
+		t.Errorf("counts = %+v, want two sessions seen and one transcript staged", c)
+	}
+}
