@@ -188,3 +188,117 @@ func TestChildEnvPassesTokenAndStripsNesting(t *testing.T) {
 		}
 	}
 }
+
+func TestCopyIntoReportsChmodAndCopyFailures(t *testing.T) {
+	// A source that opens but cannot be read, such as a directory, must fail
+	// the copy rather than leave an empty destination looking successful.
+	dst := filepath.Join(t.TempDir(), "out.html")
+	if err := copyFile(t.TempDir(), dst, 0o600); err == nil {
+		t.Error("copying from a directory succeeded; want a read error")
+	}
+
+	// A destination whose mode cannot be forced must fail rather than keep
+	// looser permissions. /dev/null is not owned by the test user.
+	src := filepath.Join(t.TempDir(), "src.html")
+	if err := os.WriteFile(src, []byte("report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(src, os.DevNull, 0o666); err == nil {
+		t.Error("copying onto a destination that refuses chmod succeeded; want an error")
+	}
+}
+
+func TestRunFailsWhenReportCannotBeWritten(t *testing.T) {
+	bin := fakeClaude(t, `
+mkdir -p "$CLAUDE_CONFIG_DIR/usage-data"
+echo '<html>fresh</html>' > "$CLAUDE_CONFIG_DIR/usage-data/report-2026-09-11-120000.html"
+`)
+
+	// A regular file where the output directory should be cannot be created.
+	blocked := filepath.Join(t.TempDir(), "nope")
+	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Run(Options{Real: realPaths(t), Stage: t.TempDir(), ClaudeBin: bin, OutPath: filepath.Join(blocked, "sub", "r.html")})
+	if err == nil || !strings.Contains(err.Error(), "creating output directory") {
+		t.Errorf("expected an output directory error, got %v", err)
+	}
+	if r.Report != "" {
+		t.Errorf("Report = %q, want empty on failure", r.Report)
+	}
+
+	// An existing directory at the output path cannot be opened as a file.
+	outDir := filepath.Join(t.TempDir(), "r.html")
+	if err := os.Mkdir(outDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r, err = Run(Options{Real: realPaths(t), Stage: t.TempDir(), ClaudeBin: bin, OutPath: outDir})
+	if err == nil || !strings.Contains(err.Error(), "copying report") {
+		t.Errorf("expected a copying report error, got %v", err)
+	}
+	if r.Report != "" {
+		t.Errorf("Report = %q, want empty on failure", r.Report)
+	}
+}
+
+func TestRunReportsChildFailureWithOutput(t *testing.T) {
+	bin := fakeClaude(t, `echo "boom happened"; exit 7`)
+	_, err := Run(Options{Real: realPaths(t), Stage: t.TempDir(), ClaudeBin: bin, OutPath: filepath.Join(t.TempDir(), "r.html")})
+	if err == nil {
+		t.Fatal("expected an error from a failing child")
+	}
+	if !strings.Contains(err.Error(), "-p /insights") || !strings.Contains(err.Error(), "boom happened") {
+		t.Errorf("error should name the command and include child output, got %v", err)
+	}
+	if strings.Contains(err.Error(), "no report") {
+		t.Errorf("a failing child must not be reported as a missing report, got %v", err)
+	}
+}
+
+func TestCopyFileMissingSourceFailsWithoutCreatingDestination(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "out.html")
+	err := copyFile(filepath.Join(t.TempDir(), "missing.html"), dst, 0o600)
+	if !os.IsNotExist(err) {
+		t.Errorf("copyFile from a missing source = %v, want a not-exist error", err)
+	}
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Errorf("destination must not be created when the source is missing, stat err = %v", statErr)
+	}
+}
+
+func TestRunDefaultsToClaudeOnPath(t *testing.T) {
+	bin := fakeClaude(t, `echo "Not logged in · Please run /login"; exit 0`)
+	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	_, err := Run(Options{Real: realPaths(t), Stage: t.TempDir(), OutPath: filepath.Join(t.TempDir(), "r.html")})
+	if err != ErrNotLoggedIn {
+		t.Errorf("expected the claude found on PATH to run and report ErrNotLoggedIn, got %v", err)
+	}
+}
+
+func TestRunPassesChildStderrThrough(t *testing.T) {
+	bin := fakeClaude(t, `echo "child diagnostics" >&2; exit 1`)
+	var stderr strings.Builder
+	_, err := Run(Options{Real: realPaths(t), Stage: t.TempDir(), ClaudeBin: bin, OutPath: filepath.Join(t.TempDir(), "r.html"), Stderr: &stderr})
+	if err == nil {
+		t.Fatal("expected an error from a failing child")
+	}
+	if !strings.Contains(stderr.String(), "child diagnostics") {
+		t.Errorf("child stderr not passed through, got %q", stderr.String())
+	}
+}
+
+func TestHarvestCountsUnreadableSourceAsFailure(t *testing.T) {
+	from, to := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(from, "good.json"), []byte(`{"v":"stage"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A dangling symlink matches the glob but cannot be opened, which is a
+	// failure that is not "already there".
+	if err := os.Symlink(filepath.Join(from, "missing"), filepath.Join(from, "broken.json")); err != nil {
+		t.Fatal(err)
+	}
+	copied, failed := harvest(from, to)
+	if copied != 1 || failed != 1 {
+		t.Errorf("harvest = %d copied, %d failed; want 1 and 1", copied, failed)
+	}
+}
