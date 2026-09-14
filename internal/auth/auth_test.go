@@ -27,7 +27,7 @@ func isolate(t *testing.T) string {
 	return home
 }
 
-const sample = "sk-ant-oat01-test-token-value-0123456789"
+const sample = "test-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 func TestResolvePrefersEnvironment(t *testing.T) {
 	isolate(t)
