@@ -618,3 +618,200 @@ func TestWholeNumberCountIsAccepted(t *testing.T) {
 		t.Errorf("fix_bug = %v, want 3", got)
 	}
 }
+
+func TestAsCountAcceptsDecodedAndNativeNumericShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      any
+		wantN   float64
+		wantBad string
+	}{
+		{"unparseable json.Number", json.Number("abc"), 0, "is not a number"},
+		{"float64 whole", float64(2), 2, ""},
+		{"float64 fractional", float64(2.5), 0, "is not a whole number (2.5)"},
+		{"int whole", 4, 4, ""},
+		{"int negative", -3, 0, "is negative (-3)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n, bad := asCount(tc.in)
+			if n != tc.wantN || bad != tc.wantBad {
+				t.Errorf("asCount(%#v) = (%v, %q), want (%v, %q)", tc.in, n, bad, tc.wantN, tc.wantBad)
+			}
+		})
+	}
+}
+
+func TestWriteJSONReportsEncodeAndWriteFailures(t *testing.T) {
+	dir := t.TempDir()
+
+	encPath := filepath.Join(dir, "sess-unencodable.json")
+	err := writeJSON(encPath, map[string]any{"bad": func() {}})
+	if err == nil {
+		t.Fatal("want an error for a value JSON cannot encode")
+	}
+	if !strings.Contains(err.Error(), "encoding "+encPath) {
+		t.Errorf("err = %v, want an encoding error naming the file", err)
+	}
+	if _, statErr := os.Stat(encPath); !os.IsNotExist(statErr) {
+		t.Errorf("unencodable value must not be written, stat err = %v", statErr)
+	}
+
+	writePath := filepath.Join(dir, "no-such-dir", "sess-unwritable.json")
+	err = writeJSON(writePath, clean("sess-unwritable"))
+	if err == nil {
+		t.Fatal("want an error writing into a missing directory")
+	}
+	if !strings.Contains(err.Error(), "writing "+writePath) {
+		t.Errorf("err = %v, want a writing error naming the file", err)
+	}
+}
+
+func TestMalformedDirPatternIsAnError(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "[")
+
+	res, err := Dir(dir, false)
+	if err == nil {
+		t.Fatalf("want a glob error for a malformed pattern, got result %+v", res)
+	}
+	if !strings.Contains(err.Error(), dir) {
+		t.Errorf("error %q should name the directory %s", err, dir)
+	}
+	if !strings.Contains(err.Error(), filepath.ErrBadPattern.Error()) {
+		t.Errorf("error %q should wrap the bad-pattern cause", err)
+	}
+	if res.Checked != 0 || len(res.Problems) != 0 {
+		t.Errorf("want an empty result on error, got %+v", res)
+	}
+}
+
+func TestUnreadableFacetPathIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	writeFacet(t, dir, "sess-a", clean("sess-a"))
+	path := filepath.Join(dir, "sess-b.json")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatalf("creating directory fixture: %v", err)
+	}
+
+	res, err := Dir(dir, true)
+	if err == nil {
+		t.Fatal("want an error when a matched path cannot be read")
+	}
+	if res.Checked != 0 || len(res.Problems) != 0 || len(res.Fixed) != 0 || len(res.Unresolved) != 0 {
+		t.Errorf("want an empty result alongside the error, got %+v", res)
+	}
+
+	problems, changed, err := checkFile(path, true)
+	if err == nil {
+		t.Fatal("checkFile: want a read error for a directory")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error %q should name the path %s", err, path)
+	}
+	if changed {
+		t.Error("an unreadable file cannot have been changed")
+	}
+	if problems != nil {
+		t.Errorf("problems = %v, want nil on a read error", problems)
+	}
+}
+
+func TestFileThatVanishesBeforeTheRecheckIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess-gone.json")
+	proc, err := os.StartProcess("/usr/bin/mkfifo", []string{"mkfifo", path}, &os.ProcAttr{})
+	if err != nil {
+		t.Fatalf("starting mkfifo: %v", err)
+	}
+	state, err := proc.Wait()
+	if err != nil || !state.Success() {
+		t.Fatalf("mkfifo failed: %v %v", state, err)
+	}
+	b, err := json.Marshal(clean("sess-gone"))
+	if err != nil {
+		t.Fatalf("marshaling fixture: %v", err)
+	}
+
+	// The writer feeds the fix pass a clean record through the pipe, then removes
+	// the path before closing, so the fix pass reads everything but the re-check
+	// finds nothing on disk.
+	done := make(chan error, 1)
+	go func() {
+		w, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			done <- err
+			return
+		}
+		_, werr := w.Write(b)
+		rerr := os.Remove(path)
+		cerr := w.Close()
+		for _, e := range []error{werr, rerr, cerr} {
+			if e != nil {
+				done <- e
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	res, err := Dir(dir, true)
+	if gerr := <-done; gerr != nil {
+		t.Fatalf("feeding fifo: %v", gerr)
+	}
+	if err == nil {
+		t.Fatalf("want an error when the file disappears before the re-check, got %+v", res)
+	}
+	if !strings.Contains(err.Error(), "sess-gone.json") {
+		t.Errorf("error = %v, want it to name the file", err)
+	}
+	if res.Checked != 0 || len(res.Problems) != 0 || len(res.Unresolved) != 0 {
+		t.Errorf("want an empty result alongside the error, got %+v", res)
+	}
+}
+
+func TestWriteFailureDuringFixIsReturnedAsError(t *testing.T) {
+	f := clean("sess-readonly")
+	f["outcome"] = "went_great"
+	dir, path := dirWith(t, "sess-readonly", f)
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatalf("chmod fixture: %v", err)
+	}
+
+	problems, changed, err := checkFile(path, true)
+	if err == nil {
+		t.Fatalf("want a write error for a read-only facet file, got problems %v", problems)
+	}
+	if !strings.Contains(err.Error(), "sess-readonly.json") {
+		t.Errorf("error = %v, want it to name the file", err)
+	}
+	if changed {
+		t.Error("changed = true, want false when the rewrite failed")
+	}
+	if len(problems) != 1 || problems[0] != "outcome: invalid value 'went_great'" {
+		t.Errorf("problems = %v, want the invalid outcome still reported", problems)
+	}
+
+	res, err := Dir(dir, true)
+	if err == nil {
+		t.Fatalf("Dir: want a write error, got result %+v", res)
+	}
+	if res.Checked != 0 || len(res.Fixed) != 0 {
+		t.Errorf("want an empty result on I/O failure, got %+v", res)
+	}
+	if got := readFacet(t, path)["outcome"]; got != "went_great" {
+		t.Errorf("outcome = %v, want the file left untouched", got)
+	}
+}
+
+func TestInfiniteAndNaNCountsAreNotNumbers(t *testing.T) {
+	zero := 0.0
+	for _, v := range []float64{1 / zero, -1 / zero, zero / zero} {
+		n, bad := asCount(v)
+		if bad != "is not a number" {
+			t.Errorf("asCount(%v) bad = %q, want %q", v, bad, "is not a number")
+		}
+		if n != 0 {
+			t.Errorf("asCount(%v) n = %v, want 0", v, n)
+		}
+	}
+}

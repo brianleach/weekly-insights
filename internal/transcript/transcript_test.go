@@ -432,3 +432,127 @@ func TestSummarizeMissingFile(t *testing.T) {
 		t.Fatal("expected an error for a missing transcript")
 	}
 }
+
+// A destination that cannot be tightened (here a symlink loop) aborts before
+// anything is written.
+func TestWriteForChmodFailure(t *testing.T) {
+	p := claudeHome(t, "sess-6", `{"type":"user","message":{"content":"hello"}}`)
+	out := t.TempDir()
+	dest := filepath.Join(out, "sess-6.txt")
+	if err := os.Symlink(dest, dest); err != nil {
+		t.Fatalf("creating symlink loop: %v", err)
+	}
+	err := WriteFor(p, "sess-6", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{})
+	if err == nil {
+		t.Fatal("expected an error when the destination cannot be tightened")
+	}
+	if !strings.Contains(err.Error(), "tightening") {
+		t.Errorf("error should come from the tightening step, got %v", err)
+	}
+}
+
+// A destination occupied by a directory can be chmodded but not written.
+func TestWriteForWriteFailure(t *testing.T) {
+	p := claudeHome(t, "sess-7", `{"type":"user","message":{"content":"hello"}}`)
+	out := t.TempDir()
+	dest := filepath.Join(out, "sess-7.txt")
+	if err := os.Mkdir(dest, 0o700); err != nil {
+		t.Fatalf("creating blocking directory: %v", err)
+	}
+	err := WriteFor(p, "sess-7", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{})
+	if err == nil {
+		t.Fatal("expected an error when the destination is a directory")
+	}
+	if !strings.Contains(err.Error(), "writing") {
+		t.Errorf("error should come from the write step, got %v", err)
+	}
+}
+
+// Malformed array-form content yields no blocks at all rather than a partial
+// or empty-but-allocated slice.
+func TestBlocksMalformedArray(t *testing.T) {
+	got := blocks([]byte(`[{"type":"text","text":"cut off"`))
+	if got != nil {
+		t.Errorf("got %#v, want nil for malformed array content", got)
+	}
+}
+
+// A non-object element in array content is skipped without discarding the
+// blocks around it.
+func TestRenderSkipsNonObjectBlocks(t *testing.T) {
+	got := render(t, Options{},
+		`{"type":"assistant","message":{"content":[`+
+			`{"type":"text","text":"before"},`+
+			`"stray string",`+
+			`{"type":"tool_use","name":"Bash"}]}}`)
+	want := "[Assistant]: before\n[Tool: Bash]"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A user turn with no content field at all yields nothing rather than failing.
+func TestRenderUserWithoutContent(t *testing.T) {
+	got := render(t, Options{},
+		`{"type":"user","message":{}}`,
+		`{"type":"user","message":{"content":"after"}}`)
+	if got != "[User]: after" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// A non-positive cap yields nothing rather than the whole string.
+func TestTruncateNonPositiveLimit(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		if got := truncate("hello", n); got != "" {
+			t.Errorf("truncate(%q, %d) = %q, want empty", "hello", n, got)
+		}
+	}
+}
+
+// A directory opens fine on unix but fails on the first read, which exercises
+// the non-EOF read error path rather than the open error path.
+func TestForEachLineReadError(t *testing.T) {
+	dir := t.TempDir()
+	calls := 0
+	err := ForEachLine(dir, func(string) { calls++ })
+	if err == nil {
+		t.Fatal("expected an error reading a directory as a transcript")
+	}
+	if !strings.Contains(err.Error(), "reading transcript "+dir) {
+		t.Errorf("error should come from the read, not the open: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("fn called %d times, want 0", calls)
+	}
+}
+
+// A non-positive budget disables elision rather than cutting everything.
+func TestElideNonPositiveMaxKeepsBody(t *testing.T) {
+	body := strings.Repeat("a", 50)
+	if got := elide(body, 0); got != body {
+		t.Errorf("got %q, want body unchanged", got)
+	}
+}
+
+// A transcript that exists but cannot be read must surface as a render error,
+// not be mistaken for an empty session.
+func TestWriteForRenderError(t *testing.T) {
+	home := t.TempDir()
+	// A directory where the .jsonl should be opens fine but fails on read.
+	if err := os.MkdirAll(filepath.Join(home, "projects", "-tmp-fixture", "sess-6.jsonl"), 0o755); err != nil {
+		t.Fatalf("creating fixture: %v", err)
+	}
+	p := store.Paths{Root: filepath.Join(home, "usage-data"), ClaudeHome: home}
+	out := filepath.Join(t.TempDir(), "prepared")
+	err := WriteFor(p, "sess-6", "/tmp/fixture", "2026-09-11T10:00:00Z", out, Options{})
+	if err == nil {
+		t.Fatal("expected an error when the transcript cannot be read")
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a located but unreadable transcript should not report ErrNotExist, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "sess-6.txt")); !os.IsNotExist(statErr) {
+		t.Errorf("expected no output file on render failure, stat err = %v", statErr)
+	}
+}
