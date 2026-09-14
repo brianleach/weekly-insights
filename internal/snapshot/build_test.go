@@ -521,3 +521,138 @@ func TestSaveWritesOwnerOnlyPermissions(t *testing.T) {
 		t.Errorf("mode after overwrite = %v, want 0600", fi.Mode().Perm())
 	}
 }
+
+func TestBuildSkipsNonPositiveFrictionCounts(t *testing.T) {
+	collapses := map[string]map[string]bool{}
+	s := Build(testWindow([]model.Session{
+		{
+			Meta: model.SessionMeta{SessionID: "s1", StartTime: "2020-03-02T09:00:00Z"},
+			Facets: &model.Facets{
+				FrictionCounts: map[string]int{"unverified_claim": 0, "ignored_stated_preference": 1},
+			},
+			FacetSource: store.SourceCanonical,
+		},
+	}), 7, collapses)
+
+	if _, ok := s.Friction[taxonomy.FrictionUnverifiedClaim]; ok {
+		t.Errorf("zero-valued friction should not be counted: %v", s.Friction)
+	}
+	if _, ok := collapses["friction:"+taxonomy.FrictionUnverifiedClaim]; ok {
+		t.Errorf("zero-valued friction should not be recorded as a collapse: %v", collapses)
+	}
+	if s.Friction[taxonomy.FrictionIgnoredPreference] != 1 || len(s.Friction) != 1 {
+		t.Errorf("friction = %v", s.Friction)
+	}
+}
+
+func TestBuildSkipsBlankCorrectionsWithinCap(t *testing.T) {
+	s := Build(testWindow([]model.Session{
+		{
+			Meta: model.SessionMeta{SessionID: "abcdefgh-ijkl", StartTime: "2020-03-02T09:00:00Z"},
+			Facets: &model.Facets{
+				UserCorrections: []string{"  first  ", "   ", "", "second"},
+			},
+			FacetSource: store.SourceCanonical,
+		},
+	}), 7, nil)
+
+	if len(s.UserCorrections) != 2 {
+		t.Fatalf("user corrections = %+v, want only the two non-blank quotes", s.UserCorrections)
+	}
+	if s.UserCorrections[0].Quote != "first" || s.UserCorrections[1].Quote != "second" {
+		t.Errorf("user corrections = %+v", s.UserCorrections)
+	}
+}
+
+func TestLoadWindowRejectsMalformedSnapshot(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	if err := os.MkdirAll(p.Snapshots(), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(p.Snapshots(), FileName("2020-03-08", 7))
+	if err := os.WriteFile(path, []byte(`{"window": {"label": "2020-03-08"`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	got, err := LoadWindow(p, "2020-03-08", 7)
+	if err == nil {
+		t.Fatalf("LoadWindow of a truncated file should error, got %+v", got)
+	}
+	if got.Window.Label != "" {
+		t.Errorf("snapshot on parse error = %+v, want zero value", got.Window)
+	}
+}
+
+func TestListReportsMalformedSnapshotDirectory(t *testing.T) {
+	// An unterminated "[" in the root makes the glob pattern malformed.
+	p := store.Paths{Root: filepath.Join(t.TempDir(), "bad["), ClaudeHome: t.TempDir()}
+
+	list, err := List(p)
+	if err == nil {
+		t.Fatalf("List with a malformed glob pattern should error, got %+v", list)
+	}
+	if list != nil {
+		t.Errorf("list = %+v, want nil on glob error", list)
+	}
+}
+
+func TestListSkipsUnreadableEntries(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	if _, err := Save(p, buildFor("2020-03-08", 7, 4)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	// A directory matching the glob cannot be read as a file, and it sorts
+	// ahead of the real snapshot so a skip that stops the loop would be caught.
+	if err := os.Mkdir(filepath.Join(p.Snapshots(), "2020-03-01.json"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	list, err := List(p)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].Window.Label != "2020-03-08" || list[0].Volume.Messages != 4 {
+		t.Errorf("list = %+v, want only the readable 2020-03-08 snapshot", list)
+	}
+}
+
+func TestListSkipsUnparseableAndUnlabelledFiles(t *testing.T) {
+	p := store.Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	if _, err := Save(p, buildFor("2020-03-08", 7, 4)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(p.Snapshots(), "2020-03-09.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write malformed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(p.Snapshots(), "2020-03-10.json"), []byte(`{"volume":{"messages":3}}`), 0o600); err != nil {
+		t.Fatalf("write unlabelled: %v", err)
+	}
+
+	list, err := List(p)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("want only the valid snapshot, got %d: %+v", len(list), list)
+	}
+	if list[0].Window.Label != "2020-03-08" || list[0].Volume.Messages != 4 {
+		t.Errorf("list[0] = %+v", list[0])
+	}
+}
+
+func TestBuildKeepsShortStartTimeAsDate(t *testing.T) {
+	s := Build(testWindow([]model.Session{
+		{
+			Meta:        model.SessionMeta{SessionID: "s1", StartTime: "2020-03"},
+			Facets:      &model.Facets{FrictionDetail: "slow"},
+			FacetSource: store.SourceCanonical,
+		},
+	}), 7, nil)
+
+	if len(s.FrictionDetails) != 1 || s.FrictionDetails[0].Date != "2020-03" {
+		t.Errorf("friction details = %+v, want date 2020-03", s.FrictionDetails)
+	}
+	if s.Volume.DaysActive != 1 {
+		t.Errorf("days_active = %d, want 1", s.Volume.DaysActive)
+	}
+}

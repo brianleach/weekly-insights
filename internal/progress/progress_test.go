@@ -242,3 +242,105 @@ func TestRunDetectsNotLoggedIn(t *testing.T) {
 		t.Errorf("expected runner.ErrNotLoggedIn, got %v", err)
 	}
 }
+
+func TestRenderListsResolvedThemes(t *testing.T) {
+	m := Memo{
+		Verdict:   "Better",
+		Resolved:  []Resolved{{Theme: "Broken <links>", LastSeen: "2026-08-28", Note: "gone & stayed gone"}},
+		OneChange: "c",
+	}
+	got := Render(m, "", oneWeek(t))
+	want := `<div class="big-wins">` + "\n" +
+		`<div class="big-win"><div class="big-win-title">Broken &lt;links&gt; <span class="muted">last seen Aug 28</span></div><div class="big-win-desc">gone &amp; stayed gone</div></div>` + "\n" +
+		"</div>\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("resolved section not rendered as expected:\n%s", got)
+	}
+	if strings.Contains(got, "No earlier theme has disappeared yet.") {
+		t.Error("empty resolved message shown despite resolved themes")
+	}
+}
+
+func TestRenderShowsAlreadyHaveAndNumbers(t *testing.T) {
+	m := Memo{
+		Verdict:     "Better",
+		AlreadyHave: []string{"Verify <first>", "Link PRs"},
+		Numbers:     "Friction fell & rates rose",
+		OneChange:   "c",
+	}
+	got := Render(m, "", oneWeek(t))
+	for _, want := range []string{
+		"<h2>Still Being Suggested, Already In Place</h2>\n<ul class=\"plain\">\n<li>Verify &lt;first&gt;</li>\n<li>Link PRs</li>\n</ul>\n",
+		"<h2>Numbers</h2>\n<div class=\"narrative\"><p>Friction fell &amp; rates rose</p></div>\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render missing %q", want)
+		}
+	}
+	if strings.Contains(Render(Memo{Verdict: "v", Numbers: "  "}, "", oneWeek(t)), "<h2>Numbers</h2>") {
+		t.Error("blank numbers must not render a section")
+	}
+}
+
+func TestInstructionsReturnsEmbeddedPrompt(t *testing.T) {
+	want, err := os.ReadFile("prompt.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Instructions()
+	if got == "" || got != string(want) {
+		t.Errorf("Instructions() = %q, want the contents of prompt.md", got)
+	}
+}
+
+func TestInputTextOmitsEmptySections(t *testing.T) {
+	in := Input{Weeks: []Week{{Label: "2026-09-11", Days: 7, Features: []string{"Hooks"}}}}
+	txt := in.Text()
+	if !strings.Contains(txt, "Features suggested:\n  - Hooks\n") {
+		t.Errorf("non-empty section missing: %q", txt)
+	}
+	for _, unwanted := range []string{"At a glance:", "Horizon ideas:"} {
+		if strings.Contains(txt, unwanted) {
+			t.Errorf("empty section %q must be omitted: %q", unwanted, txt)
+		}
+	}
+}
+
+func TestParseRejectsMalformedObject(t *testing.T) {
+	m, err := Parse("prose {\"verdict\":\"flat\", oops} more prose")
+	if err == nil {
+		t.Fatal("expected an error for a malformed JSON object")
+	}
+	if !strings.Contains(err.Error(), "parsing memo JSON") {
+		t.Errorf("error = %v", err)
+	}
+	if m.Verdict != "" {
+		t.Errorf("a malformed reply must not yield a memo, got %+v", m)
+	}
+}
+
+func TestLongDateEscapesUnparseableLabel(t *testing.T) {
+	if got := longDate("week <one>"); got != "week &lt;one&gt;" {
+		t.Errorf("longDate = %q, want the escaped label", got)
+	}
+}
+
+func TestRenderShowsNonDateWeekLabelsAsWritten(t *testing.T) {
+	m := Memo{
+		Verdict:  "v",
+		Resolved: []Resolved{{Theme: "Flaky tests", LastSeen: "early spring", Note: "gone"}},
+	}
+	got := Render(m, "", oneWeek(t))
+	if !strings.Contains(got, `<span class="muted">last seen early spring</span>`) {
+		t.Errorf("a last_seen that is not a date must be shown as written, got %q", got)
+	}
+}
+
+func TestFilepathBaseWithoutSeparator(t *testing.T) {
+	if got := filepathBase("insights-7d-2026-09-11.html"); got != "insights-7d-2026-09-11.html" {
+		t.Errorf("filepathBase = %q", got)
+	}
+	if got := filepathBase(`C:\reports\insights-7d-2026-09-11.html`); got != "insights-7d-2026-09-11.html" {
+		t.Errorf("filepathBase with backslash = %q", got)
+	}
+}
