@@ -397,3 +397,16 @@ func TestBuildFailsWhenTranscriptCannotBeStaged(t *testing.T) {
 		t.Errorf("counts = %+v, want two sessions seen and one transcript staged", c)
 	}
 }
+
+// A missing source surfaces the walk error instead of creating an empty copy.
+func TestCopyDirReportsMissingSource(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "missing")
+	dst := filepath.Join(t.TempDir(), "copy")
+	err := copyDir(src, dst)
+	if !os.IsNotExist(err) {
+		t.Fatalf("copyDir err = %v, want a not-exist error for the missing source", err)
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Errorf("destination should not be created when the source is missing, stat err = %v", err)
+	}
+}

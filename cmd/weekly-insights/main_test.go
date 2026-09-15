@@ -9,6 +9,24 @@ import (
 	"testing"
 )
 
+// stubKeychain makes the macOS keychain deterministic for tests of the auth
+// command. On darwin the auth package shells out to `security`, which against
+// a locked or absent login keychain blocks forever: that is what hung the CI
+// job. Exit 44 is how `security` reports an item that is not in the keychain,
+// so a stub that always says so puts every keychain path in a known state:
+// Store falls back to the token file, Resolve finds nothing in the keychain,
+// and Clear treats the absent item as success. The developer's real keychain
+// is never touched. On Linux the keychain is never consulted and the stub goes
+// unused.
+func stubKeychain(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "security"), []byte("#!/bin/sh\nexit 44\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
 func captureStdout(t *testing.T, fn func() error) (string, error) {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -512,5 +530,402 @@ func TestMainDispatch(t *testing.T) {
 	main()
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		t.Errorf("prepare via main did not create out dir: %v", err)
+	}
+}
+
+func TestCmdAuthStoresTokenFromStdin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	// This test covers the token file fallback, which is where every platform
+	// lands when the keychain holds nothing.
+	stubKeychain(t)
+
+	origStdin, origStderr := os.Stdin, os.Stderr
+	t.Cleanup(func() {
+		os.Stdin = origStdin
+		os.Stderr = origStderr
+	})
+
+	in, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inW.WriteString("sk-ant-oat01-testtoken0123456789\n"); err != nil {
+		t.Fatal(err)
+	}
+	inW.Close()
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(errR)
+		done <- string(b)
+	}()
+	os.Stdin = in
+	os.Stderr = errW
+	runErr := cmdAuth(nil)
+	os.Stderr = origStderr
+	os.Stdin = origStdin
+	errW.Close()
+	in.Close()
+	stderr := <-done
+	if runErr != nil {
+		t.Fatalf("cmdAuth: %v", runErr)
+	}
+	if !strings.Contains(stderr, "token stored ("+home) {
+		t.Errorf("stderr = %q, want stored path under %s", stderr, home)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdAuth([]string{"--check"}) })
+	if err != nil || !strings.Contains(out, "token available") {
+		t.Errorf("cmdAuth --check after store: out %q, err %v", out, err)
+	}
+
+	empty, emptyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyW.Close()
+	os.Stdin = empty
+	err = cmdAuth(nil)
+	os.Stdin = origStdin
+	empty.Close()
+	if err == nil {
+		t.Errorf("want error for empty token input")
+	}
+}
+
+func TestCmdPrepareSessions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".claude", "usage-data")
+	projects := filepath.Join(home, ".claude", "projects", "-home-u-work-app")
+	for _, d := range []string{filepath.Join(root, "session-meta"), filepath.Join(root, "weekly-facets"), projects} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := map[string]bool{
+		"aaaaaaaa-1111-4111-8111-111111111111": true,
+		"bbbbbbbb-2222-4222-8222-222222222222": false,
+		"cccccccc-3333-4333-8333-333333333333": true,
+	}
+	for id, hasTranscript := range ids {
+		meta := `{"session_id":"` + id + `","project_path":"/home/u/work/app","start_time":"2026-01-08T10:00:00Z","duration_minutes":30,"user_message_count":10,"assistant_message_count":10,"first_prompt":"fix the build"}`
+		if err := os.WriteFile(filepath.Join(root, "session-meta", id+".json"), []byte(meta), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if !hasTranscript {
+			continue
+		}
+		lines := `{"type":"user","sessionId":"` + id + `","cwd":"/home/u/work/app","timestamp":"2026-01-08T10:00:00Z","message":{"role":"user","content":"fix the build"}}` + "\n" +
+			`{"type":"assistant","sessionId":"` + id + `","cwd":"/home/u/work/app","timestamp":"2026-01-08T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}` + "\n"
+		if err := os.WriteFile(filepath.Join(projects, id+".jsonl"), []byte(lines), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canon := "cccccccc-3333-4333-8333-333333333333"
+	facet := `{"session_id":"` + canon + `","underlying_goal":"fix the build","goal_categories":{"debugging":1},"outcome":"fully_achieved","claude_helpfulness":"very_helpful","session_type":"single_task","friction_counts":{},"brief_summary":"fixed"}`
+	if err := os.WriteFile(filepath.Join(root, "weekly-facets", canon+".json"), []byte(facet), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--root", root, "--days", "7", "--end", "2026-01-10"}
+
+	needed := filepath.Join(t.TempDir(), "needed")
+	if err := cmdPrepare(append(args, "--out", needed)); err != nil {
+		t.Fatalf("cmdPrepare: %v", err)
+	}
+	entries, err := os.ReadDir(needed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("want only the uncanonicalized session with a transcript rendered, got %v", entries)
+	}
+
+	capped := filepath.Join(t.TempDir(), "capped")
+	if err := cmdPrepare(append(args, "--out", capped, "--all", "--limit", "1")); err != nil {
+		t.Fatalf("cmdPrepare --all --limit 1: %v", err)
+	}
+	entries, err = os.ReadDir(capped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("want --limit 1 to render one transcript, got %v", entries)
+	}
+
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = cmdPrepare(append(args, "--out", filepath.Join(blocker, "sub")))
+	if err == nil || !strings.Contains(err.Error(), "creating") {
+		t.Errorf("want creating out dir error, got %v", err)
+	}
+}
+
+func TestCmdAuthCheckAndClear(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	stubKeychain(t)
+
+	_, err := captureStdout(t, func() error { return cmdAuth([]string{"--check"}) })
+	if err == nil || !strings.Contains(err.Error(), "no token found") {
+		t.Fatalf("want no token error, got %v", err)
+	}
+
+	token := "sk-ant-oat01-" + strings.Repeat("a", 64)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString(token + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	origStdin := os.Stdin
+	os.Stdin = r
+	err = cmdAuth(nil)
+	os.Stdin = origStdin
+	r.Close()
+	if err != nil {
+		t.Fatalf("cmdAuth store: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdAuth([]string{"--check"}) })
+	if err != nil {
+		t.Fatalf("cmdAuth --check: %v", err)
+	}
+	if !strings.Contains(out, "token available (") {
+		t.Errorf("check output = %q", out)
+	}
+	if strings.Contains(out, token) {
+		t.Errorf("check printed the token: %q", out)
+	}
+
+	out, err = captureStdout(t, func() error { return cmdAuth([]string{"--clear"}) })
+	if err != nil {
+		t.Fatalf("cmdAuth --clear: %v", err)
+	}
+	if !strings.Contains(out, "stored token removed") {
+		t.Errorf("clear output = %q", out)
+	}
+
+	_, err = captureStdout(t, func() error { return cmdAuth([]string{"--check"}) })
+	if err == nil || !strings.Contains(err.Error(), "no token found") {
+		t.Errorf("want no token error after clear, got %v", err)
+	}
+}
+
+func TestCmdAggregateExplainPrintsCollapsedLabels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	id := "0123456789abcdef-aaaa-bbbb-cccc-000000000001"
+	meta := `{"session_id":"` + id + `","project_path":"/home/u/code/app","start_time":"2026-01-08T10:00:00.000Z",` +
+		`"duration_minutes":45,"user_message_count":12,"assistant_message_count":30,` +
+		`"tool_counts":{"Bash":5},"tool_errors":0,"lines_added":10,"lines_removed":2,"files_modified":1,` +
+		`"first_prompt":"fix the build","summary":"fixed the build"}`
+	facets := `{"session_id":"` + id + `","underlying_goal":"Fix the build",` +
+		`"goal_categories":{"Debugging Code":1,"Fix Failing Build":1},"outcome":"Fully Achieved",` +
+		`"user_satisfaction_counts":{"Very Satisfied":1},"claude_helpfulness":"Very Helpful",` +
+		`"session_type":"Single Task","friction_counts":{"Wrong Approach":1},"friction_detail":"took a detour",` +
+		`"primary_success":"Correct Code Edits","brief_summary":"Fixed the build."}`
+	for dir, body := range map[string]string{"session-meta": meta, "facets": facets} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, dir, id+".json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origErr := os.Stderr
+	os.Stderr = w
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	_, runErr := captureStdout(t, func() error {
+		return cmdAggregate([]string{"--root", root, "--days", "7", "--end", "2026-01-10", "--explain", "--no-save", "--quiet"})
+	})
+	os.Stderr = origErr
+	w.Close()
+	stderr := <-done
+	if runErr != nil {
+		t.Fatalf("cmdAggregate --explain: %v", runErr)
+	}
+	if !strings.Contains(stderr, "label normalization") {
+		t.Fatalf("explain header missing: %q", stderr)
+	}
+	if !strings.Contains(stderr, "  [") || !strings.Contains(stderr, " <- ") {
+		t.Errorf("explain output lists no collapsed labels: %q", stderr)
+	}
+	if !strings.Contains(stderr, "Fully Achieved") && !strings.Contains(stderr, "Wrong Approach") && !strings.Contains(stderr, "Debugging Code") {
+		t.Errorf("explain output missing the free-form labels seen: %q", stderr)
+	}
+}
+
+func TestCmdValidateReportsProblemsByFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(dir string, extra ...string) (string, int) {
+		args := strings.Join(append([]string{"validate", "--root", root, "--dir", dir}, extra...), " ")
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		proc, err := os.StartProcess(exe, []string{exe, "-test.run=^TestMainDispatch$"}, &os.ProcAttr{
+			Env:   append([]string{"WEEKLY_INSIGHTS_MAIN_ARGS=" + args}, os.Environ()...),
+			Files: []*os.File{nil, w, w},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+		out, _ := io.ReadAll(r)
+		r.Close()
+		st, err := proc.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out), st.ExitCode()
+	}
+
+	facet := []byte(`{"session_id":"sess-1","outcome":"Fully Achieved","session_type":"Totally Bogus Type"}`)
+
+	plain := t.TempDir()
+	if err := os.WriteFile(filepath.Join(plain, "sess-1.json"), facet, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := run(plain)
+	if code != 1 {
+		t.Errorf("unfixed problems exit = %d, want 1; output %q", code, out)
+	}
+	if !strings.Contains(out, "sess-1.json\n    ") {
+		t.Errorf("problems not grouped under the file name: %q", out)
+	}
+	if strings.Contains(out, "[fixed]") {
+		t.Errorf("file marked fixed without --fix: %q", out)
+	}
+	if !strings.Contains(out, "1 facet files, 1 with problems") {
+		t.Errorf("summary wrong: %q", out)
+	}
+
+	fixDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fixDir, "sess-1.json"), facet, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = run(fixDir, "--fix")
+	if !strings.Contains(out, "sess-1.json [fixed]\n    ") {
+		t.Errorf("fixed file not marked: %q", out)
+	}
+	if !strings.Contains(out, "1 with problems") {
+		t.Errorf("summary wrong after --fix: %q", out)
+	}
+}
+
+func TestCmdSelectWorklistOrdersAndCaps(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".claude", "usage-data")
+	metaDir := filepath.Join(root, "session-meta")
+	projDir := filepath.Join(home, ".claude", "projects", "-work-app")
+	for _, d := range []string{metaDir, projDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessions := []struct {
+		id   string
+		msgs int
+	}{
+		{"aaaaaaaa-1111-4111-8111-111111111111", 5},
+		{"bbbbbbbb-2222-4222-8222-222222222222", 12},
+		{"cccccccc-3333-4333-8333-333333333333", 8},
+	}
+	for i, s := range sessions {
+		start := "2026-01-0" + string(rune('5'+i)) + "T10:00:00Z"
+		meta := `{"session_id":"` + s.id + `","project_path":"/work/app","start_time":"` + start +
+			`","duration_minutes":45,"user_message_count":` + strings.Repeat("", 0) + func() string {
+			b, _ := json.Marshal(s.msgs)
+			return string(b)
+		}() + `,"assistant_message_count":20}`
+		if err := os.WriteFile(filepath.Join(metaDir, s.id+".json"), []byte(meta), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		line := `{"type":"user","sessionId":"` + s.id + `","timestamp":"` + start + `","message":{"role":"user","content":"hello"}}` + "\n"
+		if err := os.WriteFile(filepath.Join(projDir, s.id+".jsonl"), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdSelect([]string{"--root", root, "--days", "7", "--end", "2026-01-10", "--worklist", "--limit", "2"})
+	})
+	if err != nil {
+		t.Fatalf("cmdSelect --worklist: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 worklist rows after --limit, got %d: %q", len(lines), out)
+	}
+	var rows []struct {
+		SessionID    string `json:"session_id"`
+		Transcript   string `json:"transcript"`
+		Project      string `json:"project"`
+		UserMessages int    `json:"user_messages"`
+	}
+	for _, l := range lines {
+		var row struct {
+			SessionID    string `json:"session_id"`
+			Transcript   string `json:"transcript"`
+			Project      string `json:"project"`
+			UserMessages int    `json:"user_messages"`
+		}
+		if err := json.Unmarshal([]byte(l), &row); err != nil {
+			t.Fatalf("row is not JSON: %q: %v", l, err)
+		}
+		rows = append(rows, row)
+	}
+	if rows[0].SessionID != sessions[1].id || rows[0].UserMessages != 12 {
+		t.Errorf("first row = %+v, want the 12-message session", rows[0])
+	}
+	if rows[1].SessionID != sessions[2].id || rows[1].UserMessages != 8 {
+		t.Errorf("second row = %+v, want the 8-message session", rows[1])
+	}
+	if rows[0].Project != "/work/app" || !strings.HasSuffix(rows[0].Transcript, sessions[1].id+".jsonl") {
+		t.Errorf("row fields wrong: %+v", rows[0])
+	}
+}
+
+func TestTopN(t *testing.T) {
+	m := map[string]int{"b": 2, "a": 2, "c": 5, "d": 1}
+	got := topN(m, 3)
+	want := []kv{{"c", 5}, {"a", 2}, {"b", 2}}
+	if len(got) != len(want) {
+		t.Fatalf("topN = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("topN[%d] = %v, want %v (all: %v)", i, got[i], want[i], got)
+		}
 	}
 }

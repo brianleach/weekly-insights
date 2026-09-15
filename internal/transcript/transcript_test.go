@@ -556,3 +556,44 @@ func TestWriteForRenderError(t *testing.T) {
 		t.Errorf("expected no output file on render failure, stat err = %v", statErr)
 	}
 }
+
+// An entry with no timestamp contributes no time bound, rather than being read
+// as the zero time.
+func TestParseTimeEmpty(t *testing.T) {
+	got, ok := parseTime("")
+	if ok {
+		t.Errorf("parseTime(\"\") ok = true, want false")
+	}
+	if !got.IsZero() {
+		t.Errorf("parseTime(\"\") = %v, want zero time", got)
+	}
+	m := summarize(t, "sess-no-ts",
+		`{"type":"user","message":{"content":"no clock here"}}`,
+		`{"type":"user","timestamp":"2026-09-10T10:00:00Z","message":{"content":"later"}}`,
+	)
+	if m.StartTime != "2026-09-10T10:00:00Z" {
+		t.Errorf("StartTime = %q, want the only written timestamp", m.StartTime)
+	}
+	if m.UserMessageCount != 2 {
+		t.Errorf("UserMessageCount = %d, want 2", m.UserMessageCount)
+	}
+}
+
+// A timestamp that is not RFC3339 is ignored rather than widening the session
+// window to the zero time.
+func TestSummarizeIgnoresUnparseableTimestamp(t *testing.T) {
+	m := summarize(t, "sess-badtime",
+		`{"type":"user","timestamp":"2026-09-10T10:00:00Z","message":{"content":"a"}}`,
+		`{"type":"assistant","timestamp":"yesterday at noon","message":{"content":[{"type":"text","text":"b"}]}}`,
+		`{"type":"user","timestamp":"2026-09-10T10:30:00Z","message":{"content":"c"}}`,
+	)
+	if m.StartTime != "2026-09-10T10:00:00Z" {
+		t.Errorf("StartTime = %q, want the earliest valid timestamp", m.StartTime)
+	}
+	if m.DurationMinutes != 30 {
+		t.Errorf("DurationMinutes = %v, want 30", m.DurationMinutes)
+	}
+	if ts, ok := parseTime("yesterday at noon"); ok || !ts.IsZero() {
+		t.Errorf("parseTime = %v, %v; want zero time and false", ts, ok)
+	}
+}

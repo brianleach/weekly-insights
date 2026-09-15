@@ -815,3 +815,12 @@ func TestInfiniteAndNaNCountsAreNotNumbers(t *testing.T) {
 		}
 	}
 }
+
+func TestCountsDifferWhenAnOriginalCountIsUnusable(t *testing.T) {
+	orig := map[string]any{"fix_bug": "several"}
+	out := map[string]float64{"fix_bug": 0}
+
+	if !countsDiffer(orig, out) {
+		t.Errorf("countsDiffer(%v, %v) = false, want true for an unusable original count", orig, out)
+	}
+}
