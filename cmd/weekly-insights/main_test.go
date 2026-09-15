@@ -520,6 +520,14 @@ func TestCmdAuthStoresTokenFromStdin(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	// This test covers the token file fallback, which is where every platform
+	// lands when the keychain is unavailable. On macOS auth.Store reaches for
+	// the keychain first, and `security add-generic-password` blocks forever
+	// against a locked or absent login keychain. Point PATH at an empty
+	// directory so `security` is unreachable: the exec fails immediately, the
+	// file path is taken on every OS, and the developer's real keychain is
+	// never touched.
+	t.Setenv("PATH", t.TempDir())
 
 	origStdin, origStderr := os.Stdin, os.Stderr
 	t.Cleanup(func() {
