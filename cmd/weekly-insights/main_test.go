@@ -9,6 +9,24 @@ import (
 	"testing"
 )
 
+// stubKeychain makes the macOS keychain deterministic for tests of the auth
+// command. On darwin the auth package shells out to `security`, which against
+// a locked or absent login keychain blocks forever: that is what hung the CI
+// job. Exit 44 is how `security` reports an item that is not in the keychain,
+// so a stub that always says so puts every keychain path in a known state:
+// Store falls back to the token file, Resolve finds nothing in the keychain,
+// and Clear treats the absent item as success. The developer's real keychain
+// is never touched. On Linux the keychain is never consulted and the stub goes
+// unused.
+func stubKeychain(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "security"), []byte("#!/bin/sh\nexit 44\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
 func captureStdout(t *testing.T, fn func() error) (string, error) {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -521,13 +539,8 @@ func TestCmdAuthStoresTokenFromStdin(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 	// This test covers the token file fallback, which is where every platform
-	// lands when the keychain is unavailable. On macOS auth.Store reaches for
-	// the keychain first, and `security add-generic-password` blocks forever
-	// against a locked or absent login keychain. Point PATH at an empty
-	// directory so `security` is unreachable: the exec fails immediately, the
-	// file path is taken on every OS, and the developer's real keychain is
-	// never touched.
-	t.Setenv("PATH", t.TempDir())
+	// lands when the keychain holds nothing.
+	stubKeychain(t)
 
 	origStdin, origStderr := os.Stdin, os.Stderr
 	t.Cleanup(func() {
@@ -661,8 +674,7 @@ func TestCmdAuthCheckAndClear(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
-	// Keep any platform keychain helper from being found.
-	t.Setenv("PATH", t.TempDir())
+	stubKeychain(t)
 
 	_, err := captureStdout(t, func() error { return cmdAuth([]string{"--check"}) })
 	if err == nil || !strings.Contains(err.Error(), "no token found") {
