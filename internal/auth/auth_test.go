@@ -128,17 +128,24 @@ func TestPathIsOutsideAnyRepoCheckout(t *testing.T) {
 	}
 }
 
+// securityCall records one call to the fake `security`, including its stdin,
+// so a test can assert where the token travelled.
+type securityCall struct {
+	stdin string
+	args  []string
+}
+
 // stubKeychain turns the keychain path on and routes it at a fake `security`,
 // so the macOS branches are testable on any platform and never touch a real
 // keychain.
-func stubKeychain(t *testing.T, fn func(args ...string) ([]byte, error)) *[][]string {
+func stubKeychain(t *testing.T, fn func(stdin string, args ...string) ([]byte, error)) *[]securityCall {
 	t.Helper()
-	var calls [][]string
+	var calls []securityCall
 	oldEnabled, oldRun := keychainEnabled, runSecurity
 	keychainEnabled = true
-	runSecurity = func(args ...string) ([]byte, error) {
-		calls = append(calls, args)
-		return fn(args...)
+	runSecurity = func(stdin string, args ...string) ([]byte, error) {
+		calls = append(calls, securityCall{stdin: stdin, args: args})
+		return fn(stdin, args...)
 	}
 	t.Cleanup(func() { keychainEnabled, runSecurity = oldEnabled, oldRun })
 	return &calls
@@ -146,7 +153,7 @@ func stubKeychain(t *testing.T, fn func(args ...string) ([]byte, error)) *[][]st
 
 func TestResolveUsesKeychain(t *testing.T) {
 	isolate(t)
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		if args[0] != "find-generic-password" {
 			t.Errorf("unexpected security call %v", args)
 		}
@@ -160,7 +167,14 @@ func TestResolveUsesKeychain(t *testing.T) {
 
 func TestStoreUsesKeychain(t *testing.T) {
 	isolate(t)
-	calls := stubKeychain(t, func(args ...string) ([]byte, error) { return nil, nil })
+	calls := stubKeychain(t, func(stdin string, args ...string) ([]byte, error) {
+		// Interactive mode stores, then the read-back verifies; both go
+		// through this stub, so the second call has to answer with the token.
+		if len(args) > 0 && args[0] == "find-generic-password" {
+			return []byte(sample + "\n"), nil
+		}
+		return nil, nil
+	})
 	src, err := Store(sample)
 	if err != nil {
 		t.Fatal(err)
@@ -168,25 +182,29 @@ func TestStoreUsesKeychain(t *testing.T) {
 	if src != SourceKeychain {
 		t.Errorf("Store reported %q, want %q", src, SourceKeychain)
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("expected one security call, got %d", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("expected a store and a read-back, got %d security calls", len(*calls))
 	}
-	args := (*calls)[0]
-	if args[0] != "add-generic-password" {
-		t.Errorf("called security %q, want add-generic-password", args[0])
+	store := (*calls)[0]
+	if len(store.args) != 1 || store.args[0] != "-i" {
+		t.Errorf("called security %v, want interactive mode", store.args)
 	}
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "-s "+KeychainService) {
-		t.Errorf("service flag missing from %v", args)
-	}
-	var sawUpdate bool
-	for _, a := range args {
-		if a == "-U" {
-			sawUpdate = true
+	for _, a := range store.args {
+		if strings.Contains(a, sample) {
+			t.Fatalf("the token appeared in argv %v; it must only travel on stdin", store.args)
 		}
 	}
-	if !sawUpdate {
-		t.Errorf("-U missing from %v; an existing item would not be updated", args)
+	if !strings.Contains(store.stdin, "add-generic-password") {
+		t.Errorf("stdin %q does not carry add-generic-password", store.stdin)
+	}
+	if !strings.Contains(store.stdin, "-s "+KeychainService) {
+		t.Errorf("service flag missing from stdin %q", store.stdin)
+	}
+	if !strings.Contains(store.stdin, "-w "+sample) {
+		t.Errorf("token missing from stdin %q", store.stdin)
+	}
+	if !strings.Contains(store.stdin, "-U") {
+		t.Errorf("-U missing from stdin %q; an existing item would not be updated", store.stdin)
 	}
 	p, _ := Path()
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
@@ -194,9 +212,47 @@ func TestStoreUsesKeychain(t *testing.T) {
 	}
 }
 
+// `security -i` exits 0 even when the command it read failed, so a store that
+// did not land has to be caught by reading the item back.
+func TestStoreFallsBackWhenKeychainSilentlyDropsTheToken(t *testing.T) {
+	isolate(t)
+	stubKeychain(t, func(stdin string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "find-generic-password" {
+			return []byte("something-else\n"), nil
+		}
+		return []byte("add-generic-password: error"), nil
+	})
+	src, err := Store(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != SourceFile {
+		t.Errorf("Store reported %q; a keychain that did not keep the token must fall back to the file", src)
+	}
+}
+
+// A token outside the character set interactive mode can carry unchanged is
+// stored in the file rather than risking a mangled keychain item.
+func TestStoreFallsBackForATokenTheKeychainCannotCarry(t *testing.T) {
+	isolate(t)
+	calls := stubKeychain(t, func(stdin string, args ...string) ([]byte, error) {
+		return nil, nil
+	})
+	src, err := Store(`sk-ant-oat01-"quoted-token-value`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != SourceFile {
+		t.Errorf("Store reported %q, want the file fallback", src)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("security was called %d times; a token it cannot carry must not reach it", len(*calls))
+	}
+}
+
 func TestStoreFallsBackToFileWhenKeychainFails(t *testing.T) {
 	isolate(t)
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		return []byte("no login keychain"), errors.New("exit status 1")
 	})
 	src, err := Store(sample)
@@ -218,7 +274,7 @@ func TestStoreFallsBackToFileWhenKeychainFails(t *testing.T) {
 
 func TestClearIgnoresMissingKeychainItem(t *testing.T) {
 	isolate(t)
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		return []byte("security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."),
 			errors.New("exit status 44")
 	})
@@ -229,7 +285,7 @@ func TestClearIgnoresMissingKeychainItem(t *testing.T) {
 
 func TestClearIgnoresNotFoundInErrorText(t *testing.T) {
 	isolate(t)
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		return nil, errors.New("The specified item could not be found in the keychain.")
 	})
 	if err := Clear(); err != nil {
@@ -239,7 +295,7 @@ func TestClearIgnoresNotFoundInErrorText(t *testing.T) {
 
 func TestClearPropagatesKeychainError(t *testing.T) {
 	isolate(t)
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		return []byte("User interaction is not allowed."), errors.New("exit status 36")
 	})
 	err := Clear()
@@ -300,7 +356,7 @@ func TestClearIgnoresExitCode44(t *testing.T) {
 	isolate(t)
 	// A real *exec.ExitError, so the exit-code branch is covered rather than
 	// only the message substring.
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		return exec.Command("sh", "-c", "exit 44").CombinedOutput()
 	})
 	if err := Clear(); err != nil {
@@ -313,7 +369,7 @@ func TestClearPropagatesOtherExitCodes(t *testing.T) {
 		t.Skip("no sh to produce a real exit status")
 	}
 	isolate(t)
-	stubKeychain(t, func(args ...string) ([]byte, error) {
+	stubKeychain(t, func(_ string, args ...string) ([]byte, error) {
 		return exec.Command("sh", "-c", "exit 36").CombinedOutput()
 	})
 	if err := Clear(); err == nil {
@@ -421,17 +477,31 @@ func TestPromptTokenWarnsWhenEchoCannotBeDisabled(t *testing.T) {
 
 func TestRunSecurityInvokesSecurityOnPath(t *testing.T) {
 	dir := t.TempDir()
-	script := "#!/bin/sh\necho \"$@\"\n"
+	// The stand-in echoes its arguments and then whatever it was handed on
+	// stdin, so the test can tell the two apart.
+	script := "#!/bin/sh\necho \"args: $@\"\nwhile IFS= read -r line; do echo \"stdin: $line\"; done\n"
 	if err := os.WriteFile(filepath.Join(dir, "security"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	out, err := runSecurity("find-generic-password", "-s", KeychainService, "-w")
+	out, err := runSecurity("", "find-generic-password", "-s", KeychainService, "-w")
 	if err != nil {
 		t.Fatalf("runSecurity: %v: %s", err, out)
 	}
-	if got, want := strings.TrimSpace(string(out)), "find-generic-password -s "+KeychainService+" -w"; got != want {
+	if got, want := strings.TrimSpace(string(out)), "args: find-generic-password -s "+KeychainService+" -w"; got != want {
 		t.Errorf("security received %q, want %q", got, want)
+	}
+
+	out, err = runSecurity("add-generic-password -w "+sample+"\n", "-i")
+	if err != nil {
+		t.Fatalf("runSecurity: %v: %s", err, out)
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)
+	if lines[0] != "args: -i" {
+		t.Errorf("security argv was %q; the token must not be in it", lines[0])
+	}
+	if len(lines) < 2 || !strings.Contains(lines[1], "stdin: ") || !strings.Contains(lines[1], sample) {
+		t.Errorf("security stdin was %q, want the token", out)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/brianleach/weekly-insights/internal/model"
@@ -408,5 +409,26 @@ func TestCopyDirReportsMissingSource(t *testing.T) {
 	}
 	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
 		t.Errorf("destination should not be created when the source is missing, stat err = %v", err)
+	}
+}
+
+// The stage joins the session id into paths under both the real config
+// directory and the stage, so an id that could escape either one stops the run
+// rather than being staged.
+func TestBuildRefusesAnUnusableSessionID(t *testing.T) {
+	real := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "stage")
+	in := Inputs{
+		Paths:       store.Paths{Root: filepath.Join(real, "usage-data"), ClaudeHome: real},
+		AccountFile: filepath.Join(real, ".claude.json"),
+	}
+	sessions := []model.Session{{Meta: model.SessionMeta{SessionID: "../../../.claude"}}}
+	if _, err := Build(in, sessions, dst); err == nil {
+		t.Fatal("Build accepted a traversal session id")
+	} else if !strings.Contains(err.Error(), "unusable id") {
+		t.Fatalf("Build error = %v, want it to name the unusable id", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dst), ".claude.json")); !os.IsNotExist(err) {
+		t.Errorf("a file was written beside the stage; the copy escaped it")
 	}
 }

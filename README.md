@@ -28,7 +28,9 @@ only the window:
 then runs `claude -p /insights` against it, copies the report out, and deletes the
 stage. Nothing in the builtin is reimplemented; the report is whatever your installed
 Claude Code produces. Everything the stage copies is written with mode 0600 inside
-directories created 0700, and the whole stage is removed when the run ends.
+directories created 0700, and the whole stage is removed when the run ends,
+including when the run is interrupted with Ctrl-C. A stage older than a day, left
+behind by a run that was killed outright, is removed on the next run.
 
 Two useful side effects. The child computes session metadata for every transcript
 it sees, and the tool harvests that back into your real cache, so sessions the
@@ -102,7 +104,12 @@ On Linux you may not need a token at all: Claude Code there keeps credentials in
 file inside the config directory, and the stage carries that file along. This is
 untested; if the run reports "not logged in", use the token.
 
-The stage, which holds a copy of your account file, is removed when the run ends.
+On macOS the token is handed to `security` on standard input rather than as a
+command-line argument, so it is not visible to anything that can list processes
+while it is being stored.
+
+The stage, which holds a copy of your account file, is removed when the run ends,
+including on Ctrl-C.
 
 ## Platform support
 
@@ -247,7 +254,10 @@ user typed, verbatim.
 
 Sensitive outputs are written with restrictive permissions: staged transcripts,
 prepared transcripts, reports, snapshots and the progress memo are files of mode
-0600 inside directories created 0700.
+0600 inside directories created 0700. Each one is written to a fresh owner-only
+file and renamed into place, so replacing a file that was left behind with looser
+permissions never exposes the new contents, and a name that someone else turned
+into a symlink is replaced rather than written through.
 
 ### Network and what leaves your machine
 

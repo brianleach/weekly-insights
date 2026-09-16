@@ -8,6 +8,7 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/brianleach/weekly-insights/internal/safeio"
 	"github.com/brianleach/weekly-insights/internal/store"
 )
 
@@ -25,6 +27,10 @@ var ErrNotLoggedIn = errors.New("the staged Claude Code run was not logged in")
 
 // Options configures one run.
 type Options struct {
+	// Ctx stops the child when it is cancelled, so an interrupted run does not
+	// leave a Claude Code process holding the stage open. Nil means
+	// context.Background.
+	Ctx       context.Context
 	Real      store.Paths // the user's real config, for harvesting caches back
 	Stage     string      // populated by package stage
 	ClaudeBin string      // defaults to "claude"
@@ -48,7 +54,11 @@ func Run(o Options) (Result, error) {
 	if bin == "" {
 		bin = "claude"
 	}
-	cmd := exec.Command(bin, "-p", "/insights")
+	ctx := o.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, bin, "-p", "/insights")
 	cmd.Dir = os.TempDir()
 	cmd.Env = childEnv(o)
 	var out bytes.Buffer
@@ -57,6 +67,9 @@ func Run(o Options) (Result, error) {
 		cmd.Stderr = o.Stderr
 	}
 	err := cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return r, fmt.Errorf("the staged run was interrupted: %w", ctxErr)
+	}
 	if strings.Contains(out.String(), "Not logged in") {
 		return r, ErrNotLoggedIn
 	}
@@ -74,7 +87,9 @@ func Run(o Options) (Result, error) {
 	if err := os.MkdirAll(filepath.Dir(o.OutPath), 0o700); err != nil {
 		return r, fmt.Errorf("creating output directory: %w", err)
 	}
-	if err := copyFile(src, o.OutPath, 0o600); err != nil {
+	// safeio, so an output directory someone else can write to cannot turn the
+	// predictable report name into a symlink onto a file of theirs.
+	if err := safeio.CopyFile(src, o.OutPath, 0o600); err != nil {
 		return r, fmt.Errorf("copying report: %w", err)
 	}
 	r.Report = o.OutPath
@@ -162,34 +177,18 @@ func harvest(from, to string) (copied, failed int) {
 }
 
 // copyNew copies src to dst only if dst does not exist, returning an error
-// satisfying errors.Is(err, os.ErrExist) when it does.
+// satisfying errors.Is(err, os.ErrExist) when it does. Exclusive creation also
+// refuses a destination that is already a symlink, so a harvested cache file
+// can never be written through one.
 func copyNew(src, dst string, mode os.FileMode) error {
-	return copyInto(src, dst, mode, os.O_CREATE|os.O_EXCL|os.O_WRONLY, false)
-}
-
-// copyFile copies src over dst, creating or truncating it, and forces mode on
-// a destination that already existed with looser permissions.
-func copyFile(src, dst string, mode os.FileMode) error {
-	return copyInto(src, dst, mode, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, true)
-}
-
-func copyInto(src, dst string, mode os.FileMode, flag int, chmod bool) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, flag, mode)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
 		return err
-	}
-	// O_CREATE applies mode only when it creates the file, so an existing
-	// destination keeps whatever permissions it had until this chmod.
-	if chmod {
-		if err := out.Chmod(mode); err != nil {
-			out.Close()
-			return err
-		}
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()

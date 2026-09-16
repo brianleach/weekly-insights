@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -178,23 +179,64 @@ func TestWriteJSONErrors(t *testing.T) {
 	})
 }
 
-func TestWriteJSONChmodAndWriteFailures(t *testing.T) {
-	t.Run("write failure is an error", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "sub")
+func TestWriteJSONFailuresLeaveNothingBehind(t *testing.T) {
+	t.Run("a destination that cannot be replaced is an error", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "sub")
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		err := WriteJSON(path, map[string]int{"a": 1})
-		if err == nil {
-			t.Fatal("expected error writing to a directory")
+		if err := WriteJSON(path, map[string]int{"a": 1}); err == nil {
+			t.Fatal("expected an error writing over a directory")
 		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			t.Fatalf("expected wrapped error, got %v", err)
+		// The temporary file the write went through must not survive the
+		// failure: it holds the same session data the destination would.
+		leftovers, _ := filepath.Glob(filepath.Join(dir, ".sub.tmp*"))
+		if len(leftovers) != 0 {
+			t.Errorf("failed write left %v behind", leftovers)
 		}
-		pe, ok := u.Unwrap().(*os.PathError)
-		if !ok || pe.Op != "open" {
-			t.Fatalf("expected open path error, got %v", err)
+	})
+
+	t.Run("a pre-existing loose mode is replaced, not written through", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "snapshot.json")
+		if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteJSON(path, map[string]int{"a": 1}); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("snapshot mode = %04o, want 0600", got)
+		}
+	})
+
+	t.Run("a symlink at the destination is replaced, not followed", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("do not touch"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "snapshot.json")
+		if err := os.Symlink(target, path); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := WriteJSON(path, map[string]int{"a": 1}); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(target); string(b) != "do not touch" {
+			t.Errorf("the symlink target became %q; it must be left alone", b)
+		}
+		fi, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			t.Error("the destination is still a symlink; the write followed it")
 		}
 	})
 }
@@ -213,5 +255,57 @@ func TestMatchGlobExactPattern(t *testing.T) {
 	}
 	if c.Excluded("/work/app2") {
 		t.Fatal("expected different path not to be excluded")
+	}
+}
+
+func TestValidSessionID(t *testing.T) {
+	for _, id := range []string{"0047a6a4-d1fc-434d-947a-7880d24d3755", "abc123", "a_b.c-d"} {
+		if !ValidSessionID(id) {
+			t.Errorf("ValidSessionID(%q) = false, want true", id)
+		}
+	}
+	for _, id := range []string{
+		"", ".", "..", "../../../.claude", "a/b", `a\b`, "*", "sess*", "sess[0-9]",
+		".hidden", "with space", "with\nnewline", strings.Repeat("a", 129),
+	} {
+		if ValidSessionID(id) {
+			t.Errorf("ValidSessionID(%q) = true, want false", id)
+		}
+	}
+}
+
+// A tampered or corrupt cache record must not be able to steer a later path
+// join out of the directory the caller named.
+func TestLoadAllMetaDropsUnusableSessionIDs(t *testing.T) {
+	dir := t.TempDir()
+	p := Paths{Root: dir, ClaudeHome: dir}
+	if err := os.MkdirAll(p.SessionMeta(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, id string) {
+		body := `{"session_id":"` + id + `","user_message_count":5,"duration_minutes":10}`
+		if err := os.WriteFile(filepath.Join(p.SessionMeta(), name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("good.json", "good-session-id")
+	write("bad.json", "../../../.claude")
+
+	metas, err := p.LoadAllMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 || metas[0].SessionID != "good-session-id" {
+		t.Fatalf("LoadAllMeta = %+v, want only the usable record", metas)
+	}
+}
+
+func TestLookupsRefuseUnusableSessionIDs(t *testing.T) {
+	p := Paths{Root: t.TempDir(), ClaudeHome: t.TempDir()}
+	if f, src := p.LoadFacets("../../../.claude"); f != nil || src != "" {
+		t.Errorf("LoadFacets returned %v/%q for a traversal id", f, src)
+	}
+	if got := p.TranscriptPath("*"); got != "" {
+		t.Errorf("TranscriptPath(%q) = %q; a glob must not match anything", "*", got)
 	}
 }
