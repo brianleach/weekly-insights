@@ -393,22 +393,6 @@ func TestStoreReportsFileErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if runtime.GOOS == "linux" {
-		// procfs accepts the write but refuses a mode change, even for root.
-		old, err := os.ReadFile("/proc/self/comm")
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.WriteFile("/proc/self/comm", old, 0o600) })
-		if err := os.Symlink("/proc/self/comm", p); err != nil {
-			t.Fatal(err)
-		}
-		src, err = Store(sample)
-		if err == nil || src != SourceNone || !strings.Contains(err.Error(), "securing token file") {
-			t.Errorf("Store with an unchmoddable token file = %q, %v; want a securing error", src, err)
-		}
-	}
-
 	// No way to locate the user config dir at all.
 	t.Setenv("HOME", "")
 	t.Setenv("XDG_CONFIG_HOME", "")
@@ -529,5 +513,50 @@ func TestResolveIgnoresBlankFile(t *testing.T) {
 	}
 	if tok, src := Resolve(); tok != "" || src != SourceNone {
 		t.Errorf("blank token file resolved to %q from %q", tok, src)
+	}
+}
+
+// A symlink planted at the token path used to be written through, which put
+// the token in a file the planter chose and left the mode change to fail
+// afterwards. The write now replaces the name instead.
+func TestStoreReplacesASymlinkAtTheTokenPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	isolate(t)
+	p, _ := Path()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(t.TempDir(), "decoy")
+	if err := os.WriteFile(decoy, []byte("not the token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(decoy, p); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	src, err := Store(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != SourceFile {
+		t.Errorf("Store reported %q, want %q", src, SourceFile)
+	}
+	if b, _ := os.ReadFile(decoy); string(b) != "not the token" {
+		t.Errorf("the symlink target holds %q; the token was written through the link", b)
+	}
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("the token path is still a symlink")
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("token file mode = %04o, want 0600", fi.Mode().Perm())
+	}
+	if tok, from := Resolve(); tok != sample || from != SourceFile {
+		t.Errorf("Resolve = %q from %q, want the stored token from the file", tok, from)
 	}
 }
