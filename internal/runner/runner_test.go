@@ -1,11 +1,13 @@
 package runner
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/brianleach/weekly-insights/internal/safeio"
 	"github.com/brianleach/weekly-insights/internal/store"
 )
 
@@ -189,22 +191,47 @@ func TestChildEnvPassesTokenAndStripsNesting(t *testing.T) {
 	}
 }
 
-func TestCopyIntoReportsChmodAndCopyFailures(t *testing.T) {
+func TestCopyNewRefusesAnExistingDestination(t *testing.T) {
 	// A source that opens but cannot be read, such as a directory, must fail
 	// the copy rather than leave an empty destination looking successful.
-	dst := filepath.Join(t.TempDir(), "out.html")
-	if err := copyFile(t.TempDir(), dst, 0o600); err == nil {
+	dst := filepath.Join(t.TempDir(), "out.json")
+	if err := copyNew(t.TempDir(), dst, 0o600); err == nil {
 		t.Error("copying from a directory succeeded; want a read error")
 	}
 
-	// A destination whose mode cannot be forced must fail rather than keep
-	// looser permissions. /dev/null is not owned by the test user.
-	src := filepath.Join(t.TempDir(), "src.html")
-	if err := os.WriteFile(src, []byte("report"), 0o600); err != nil {
+	// Harvesting must never overwrite a file already in the real cache, and
+	// must report that case distinctly so the caller does not count it failed.
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.json")
+	if err := os.WriteFile(src, []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyFile(src, os.DevNull, 0o666); err == nil {
-		t.Error("copying onto a destination that refuses chmod succeeded; want an error")
+	existing := filepath.Join(dir, "existing.json")
+	if err := os.WriteFile(existing, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyNew(src, existing, 0o600); !errors.Is(err, os.ErrExist) {
+		t.Errorf("copyNew onto an existing file = %v; want os.ErrExist", err)
+	}
+	if b, _ := os.ReadFile(existing); string(b) != "old" {
+		t.Errorf("existing cache file became %q; it must not be overwritten", b)
+	}
+
+	// The same exclusive creation is what stops a symlink planted at the
+	// destination from being written through to its target.
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := copyNew(src, link, 0o600); !errors.Is(err, os.ErrExist) {
+		t.Errorf("copyNew onto a symlink = %v; want os.ErrExist", err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "target" {
+		t.Errorf("symlink target became %q; it must not be written through", b)
 	}
 }
 
@@ -255,11 +282,11 @@ func TestRunReportsChildFailureWithOutput(t *testing.T) {
 	}
 }
 
-func TestCopyFileMissingSourceFailsWithoutCreatingDestination(t *testing.T) {
+func TestCopyMissingSourceFailsWithoutCreatingDestination(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "out.html")
-	err := copyFile(filepath.Join(t.TempDir(), "missing.html"), dst, 0o600)
+	err := safeio.CopyFile(filepath.Join(t.TempDir(), "missing.html"), dst, 0o600)
 	if !os.IsNotExist(err) {
-		t.Errorf("copyFile from a missing source = %v, want a not-exist error", err)
+		t.Errorf("CopyFile from a missing source = %v, want a not-exist error", err)
 	}
 	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
 		t.Errorf("destination must not be created when the source is missing, stat err = %v", statErr)

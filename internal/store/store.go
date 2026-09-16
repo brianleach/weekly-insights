@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/brianleach/weekly-insights/internal/model"
+	"github.com/brianleach/weekly-insights/internal/safeio"
 )
 
 // FacetSource distinguishes facets we extracted from facets the builtin did.
@@ -118,6 +119,30 @@ func matchGlob(pattern, s string) bool {
 	}
 }
 
+// ValidSessionID reports whether an id is safe to join into a path.
+//
+// Session ids reach this tool from the contents of cache files, not only from
+// their names, and everything downstream joins them into source and
+// destination paths and into glob patterns. An id carrying a separator or a
+// "..", such as "../../../.claude", would resolve outside the directory the
+// caller meant, and one carrying "*" or "[" would match files the caller never
+// named. So an id has to be a single ordinary file-name component: no
+// separators, no relative steps, no glob syntax, nothing hidden.
+func ValidSessionID(id string) bool {
+	if id == "" || len(id) > 128 || id == "." || id == ".." || strings.HasPrefix(id, ".") {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // LoadAllMeta reads every session-meta record. Unparseable files are skipped
 // rather than fatal: the cache is written concurrently by the running CLI and
 // a half-written file should not break a report.
@@ -133,7 +158,9 @@ func (p Paths) LoadAllMeta() ([]model.SessionMeta, error) {
 			continue
 		}
 		var sm model.SessionMeta
-		if err := json.Unmarshal(b, &sm); err != nil || sm.SessionID == "" {
+		// The id inside the record, not the file name, is what the rest of
+		// the tool builds paths from, so it is checked here at the edge.
+		if err := json.Unmarshal(b, &sm); err != nil || !ValidSessionID(sm.SessionID) {
 			continue
 		}
 		out = append(out, sm)
@@ -144,6 +171,9 @@ func (p Paths) LoadAllMeta() ([]model.SessionMeta, error) {
 // LoadFacets returns the facets for a session, preferring our own canonical
 // extraction over the builtin's free-form one. Returns nil when neither exists.
 func (p Paths) LoadFacets(sessionID string) (*model.Facets, string) {
+	if !ValidSessionID(sessionID) {
+		return nil, ""
+	}
 	for _, c := range []struct{ dir, src string }{
 		{p.WeeklyFacets(), SourceCanonical},
 		{p.BuiltinFacets(), SourceBuiltin},
@@ -164,6 +194,9 @@ func (p Paths) LoadFacets(sessionID string) (*model.Facets, string) {
 // TranscriptPath finds a session's raw transcript, which lives under a
 // per-project directory whose name encodes the project path.
 func (p Paths) TranscriptPath(sessionID string) string {
+	if !ValidSessionID(sessionID) {
+		return ""
+	}
 	matches, err := filepath.Glob(filepath.Join(p.Transcripts(), "*", sessionID+".jsonl"))
 	if err != nil || len(matches) == 0 {
 		return ""
@@ -186,16 +219,8 @@ func WriteJSON(path string, v any) error {
 	if err != nil {
 		return fmt.Errorf("encoding %s: %w", path, err)
 	}
-	// os.WriteFile applies its mode only when it creates the file, so a
-	// snapshot written by an earlier version stays 0644 forever unless it is
-	// chmodded here.
-	if _, err := os.Stat(path); err == nil {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return fmt.Errorf("tightening permissions on %s: %w", path, err)
-		}
-	}
-	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
-		return fmt.Errorf("writing %s: %w", path, err)
-	}
-	return nil
+	// safeio, not os.WriteFile: a snapshot left behind at 0644 by an earlier
+	// version, or a name someone else turned into a symlink, is replaced by a
+	// fresh owner-only file rather than written through.
+	return safeio.WriteFile(path, append(b, '\n'), 0o600)
 }

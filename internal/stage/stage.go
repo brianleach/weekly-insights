@@ -73,8 +73,15 @@ func Build(in Inputs, sessions []model.Session, dst string) (Counts, error) {
 	}
 
 	for _, s := range sessions {
-		c.Sessions++
 		id := s.Meta.SessionID
+		// Ids are filtered when they are read, so one arriving here is either
+		// a caller mistake or a tampered cache record. Either way it would be
+		// joined into a path under the real config dir and under the stage, so
+		// the run stops rather than reaching outside both.
+		if !store.ValidSessionID(id) {
+			return c, fmt.Errorf("refusing to stage session with unusable id %q", id)
+		}
+		c.Sessions++
 		if err := stageTranscript(in.Paths, sp, id, &c); err != nil {
 			return c, err
 		}

@@ -123,7 +123,7 @@ func withUncached(p store.Paths, metas []model.SessionMeta) ([]model.SessionMeta
 	}
 	for _, tp := range paths {
 		id := strings.TrimSuffix(filepath.Base(tp), ".jsonl")
-		if id == "" || seen[id] {
+		if !store.ValidSessionID(id) || seen[id] {
 			continue
 		}
 		seen[id] = true

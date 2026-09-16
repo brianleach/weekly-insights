@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/brianleach/weekly-insights/internal/safeio"
 )
 
 // EnvVar is the variable Claude Code itself reads for headless auth.
@@ -41,10 +43,15 @@ const (
 // keychainEnabled is a variable so tests can force the file path on macOS.
 var keychainEnabled = runtime.GOOS == "darwin"
 
-// runSecurity runs the macOS `security` CLI. It is a variable so tests can
-// exercise the keychain paths without touching the developer's real keychain.
-var runSecurity = func(args ...string) ([]byte, error) {
-	return exec.Command("security", args...).CombinedOutput()
+// runSecurity runs the macOS `security` CLI with stdin attached. It is a
+// variable so tests can exercise the keychain paths without touching the
+// developer's real keychain.
+var runSecurity = func(stdin string, args ...string) ([]byte, error) {
+	cmd := exec.Command("security", args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	return cmd.CombinedOutput()
 }
 
 // keychainNotFoundExit is the exit status `security` uses for a missing item.
@@ -106,12 +113,11 @@ func Store(token string) (Source, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return SourceNone, fmt.Errorf("creating %s: %w", filepath.Dir(p), err)
 	}
-	if err := os.WriteFile(p, []byte(token+"\n"), 0o600); err != nil {
+	// safeio, so a token file left behind at a looser mode is replaced rather
+	// than written through: the token is never on disk readable by anyone else,
+	// not even for the moment between a write and a chmod.
+	if err := safeio.WriteFile(p, []byte(token+"\n"), 0o600); err != nil {
 		return SourceNone, fmt.Errorf("writing token file: %w", err)
-	}
-	// WriteFile does not tighten the mode of a pre-existing file.
-	if err := os.Chmod(p, 0o600); err != nil {
-		return SourceNone, fmt.Errorf("securing token file: %w", err)
 	}
 	return SourceFile, nil
 }
@@ -123,7 +129,7 @@ func Store(token string) (Source, error) {
 func Clear() error {
 	var errs []error
 	if keychainEnabled {
-		if out, err := runSecurity("delete-generic-password", "-s", KeychainService); err != nil && !isKeychainNotFound(err, out) {
+		if out, err := runSecurity("", "delete-generic-password", "-s", KeychainService); err != nil && !isKeychainNotFound(err, out) {
 			errs = append(errs, fmt.Errorf("security delete-generic-password: %w: %s", err, strings.TrimSpace(string(out))))
 		}
 	}
@@ -229,7 +235,7 @@ func validate(token string) error {
 }
 
 func fromKeychain() string {
-	out, err := runSecurity("find-generic-password", "-s", KeychainService, "-w")
+	out, err := runSecurity("", "find-generic-password", "-s", KeychainService, "-w")
 	if err != nil {
 		return ""
 	}
@@ -238,21 +244,51 @@ func fromKeychain() string {
 
 // toKeychain writes the token to the login keychain.
 //
-// The token passes through argv because the `security` CLI offers no stdin
-// mode for -w: it is briefly visible to anything listing local processes while
-// the command runs. That is the same exposure as running the documented
-// `security add-generic-password ... -w <token>` by hand, and it is confined to
-// this machine and this user's own processes. Users who object can store the
-// token in the fallback file instead, which never puts it on a command line.
+// The token is fed to `security` on stdin, using its interactive mode, rather
+// than passed as an argument. A long-lived credential in argv is readable by
+// anything that can list processes for the duration of the call and is picked
+// up by process accounting, and neither is worth doing to a token that unlocks
+// the user's subscription.
+//
+// Interactive mode splits the command line it reads, so the account name and
+// the token are checked against a conservative character set first and the
+// keychain is skipped, in favour of the fallback file, for anything outside it.
+// It also does not report the inner command's failure in its exit status, so
+// the stored item is read back and compared before this reports success.
 func toKeychain(token string) error {
+	if !keychainSafe(token) {
+		return errors.New("token contains characters that cannot be passed to the keychain safely")
+	}
 	acct := "weekly-insights"
-	if u, err := user.Current(); err == nil && u.Username != "" {
+	if u, err := user.Current(); err == nil && keychainSafe(u.Username) {
 		acct = u.Username
 	}
 	// -U updates an existing item instead of failing on it.
-	out, err := runSecurity("add-generic-password", "-a", acct, "-s", KeychainService, "-w", token, "-U")
+	cmd := fmt.Sprintf("add-generic-password -a %s -s %s -w %s -U\n", acct, KeychainService, token)
+	out, err := runSecurity(cmd, "-i")
 	if err != nil {
 		return fmt.Errorf("security add-generic-password: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	if fromKeychain() != token {
+		return fmt.Errorf("the keychain did not store the token: %s", strings.TrimSpace(string(out)))
+	}
 	return nil
+}
+
+// keychainSafe reports whether a value can cross `security -i` unchanged. The
+// set covers what a Claude Code token and an ordinary account name are made of;
+// quoting, escaping and whitespace are all excluded rather than handled.
+func keychainSafe(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == '+', r == '=', r == '/', r == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }

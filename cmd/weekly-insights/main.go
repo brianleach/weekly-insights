@@ -11,16 +11,19 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/brianleach/weekly-insights/internal/auth"
@@ -29,6 +32,7 @@ import (
 	"github.com/brianleach/weekly-insights/internal/prompt"
 	"github.com/brianleach/weekly-insights/internal/report"
 	"github.com/brianleach/weekly-insights/internal/runner"
+	"github.com/brianleach/weekly-insights/internal/safeio"
 	"github.com/brianleach/weekly-insights/internal/snapshot"
 	"github.com/brianleach/weekly-insights/internal/stage"
 	"github.com/brianleach/weekly-insights/internal/store"
@@ -209,13 +213,26 @@ func cmdInsights(args []string) error {
 		return fmt.Errorf("no substantive sessions in the last %d days", o.Days)
 	}
 
-	st, err := os.MkdirTemp("", "weekly-insights-stage-")
+	// Ctrl-C and SIGTERM cancel the run instead of killing the process, so the
+	// stage below is still removed on the way out. A signal during the child
+	// run stops the child too, through the context handed to the runner.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	sweepStaleStages()
+	st, err := os.MkdirTemp("", stagePrefix)
 	if err != nil {
 		return fmt.Errorf("creating stage: %w", err)
 	}
 	if !*keep {
-		// The stage holds a copy of the account file, so it is not left behind.
-		defer os.RemoveAll(st)
+		// The stage holds copies of the account file and of raw transcripts, so
+		// it is not left behind, and a failure to remove it is reported rather
+		// than swallowed: the run is no longer clean if those copies survive it.
+		defer func() {
+			if err := os.RemoveAll(st); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not remove the stage at %s: %v\n", st, err)
+			}
+		}()
 	}
 	counts, err := stage.Build(stage.Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, r.Substantive, st)
 	if err != nil {
@@ -235,6 +252,7 @@ func cmdInsights(args []string) error {
 	fmt.Fprintln(os.Stderr, "running claude -p /insights against the stage; this takes a few minutes ...")
 	token, _ := auth.Resolve()
 	res, err := runner.Run(runner.Options{
+		Ctx:  ctx,
 		Real: p, Stage: st, ClaudeBin: *claudeBin, Token: token,
 		OutPath: filepath.Join(*outDir, name), Stderr: os.Stderr,
 	})
@@ -411,17 +429,14 @@ func cmdAuth(args []string) error {
 
 // writeSensitive writes a page this tool generates from the user's own
 // sessions. Those pages quote prompts and project names, so the directory is
-// created owner-only and the file is owner read/write, including when it
-// replaces one left behind with looser permissions.
+// created owner-only and the file is replaced through safeio, which never
+// leaves the contents readable under a pre-existing looser mode and never
+// writes through a symlink someone else put at the path.
 func writeSensitive(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("creating %s: %w", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		return err
-	}
-	// WriteFile applies its mode only when it creates the file.
-	return os.Chmod(path, 0o600)
+	return safeio.WriteFile(path, b, 0o600)
 }
 
 // openPath opens a file with the platform's default handler. Failures are
@@ -589,7 +604,7 @@ func cmdPrepare(args []string) error {
 		if err != nil {
 			// A session whose transcript has been rotated away should not stop
 			// the run; the rest of the window is still worth preparing.
-			fmt.Fprintf(os.Stderr, "skipping %s: %v\n", m.SessionID[:8], err)
+			fmt.Fprintf(os.Stderr, "skipping %s: %v\n", shortID(m.SessionID), err)
 			continue
 		}
 		n++
@@ -865,4 +880,42 @@ func writeJSONTo(f *os.File, v any) error {
 	}
 	_, err = f.Write(append(b, '\n'))
 	return err
+}
+
+// stagePrefix names the temporary staged config directories, and is also what
+// the stale sweep matches on.
+const stagePrefix = "weekly-insights-stage-"
+
+// staleStageAge is how old a leftover stage has to be before the sweep removes
+// it. A day is far longer than any run, so a stage still in use by another run
+// on the same machine is never in scope.
+const staleStageAge = 24 * time.Hour
+
+// sweepStaleStages removes staged config directories left behind by a previous
+// run that could not clean up after itself, which a SIGKILL or a power loss can
+// always produce. They hold a copy of the account file and of raw transcripts,
+// so leaving them in the temporary directory indefinitely is worse than a
+// best-effort sweep. Failures are ignored: this is housekeeping, and the run
+// the user asked for should not fail over it.
+func sweepStaleStages() {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), stagePrefix+"*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		fi, err := os.Lstat(m)
+		if err != nil || !fi.IsDir() || time.Since(fi.ModTime()) < staleStageAge {
+			continue
+		}
+		_ = os.RemoveAll(m)
+	}
+}
+
+// shortID trims a session id for a log line. Ids come off disk, so the length
+// is not guaranteed and the slice has to be bounded.
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
