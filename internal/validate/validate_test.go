@@ -770,6 +770,9 @@ func TestFileThatVanishesBeforeTheRecheckIsAnError(t *testing.T) {
 }
 
 func TestWriteFailureDuringFixIsReturnedAsError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("write-failure test needs file modes to be enforced; root ignores them")
+	}
 	f := clean("sess-readonly")
 	f["outcome"] = "went_great"
 	dir, path := dirWith(t, "sess-readonly", f)
