@@ -309,3 +309,181 @@ func TestLookupsRefuseUnusableSessionIDs(t *testing.T) {
 		t.Errorf("TranscriptPath(%q) = %q; a glob must not match anything", "*", got)
 	}
 }
+
+func TestPathsLayout(t *testing.T) {
+	p := Paths{Root: "/synthetic/usage", ClaudeHome: "/synthetic/home"}
+	cases := []struct {
+		name, got, want string
+	}{
+		{"SessionMeta", p.SessionMeta(), "/synthetic/usage/session-meta"},
+		{"BuiltinFacets", p.BuiltinFacets(), "/synthetic/usage/facets"},
+		{"WeeklyFacets", p.WeeklyFacets(), "/synthetic/usage/weekly-facets"},
+		{"Snapshots", p.Snapshots(), "/synthetic/usage/weekly"},
+		{"Transcripts", p.Transcripts(), "/synthetic/home/projects"},
+	}
+	for _, tc := range cases {
+		if tc.got != filepath.FromSlash(tc.want) {
+			t.Errorf("%s() = %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+	// The builtin's and our own facets must never share a directory, or a
+	// write of ours would land in the builtin's cache.
+	if p.BuiltinFacets() == p.WeeklyFacets() {
+		t.Error("builtin and weekly facets resolve to the same directory")
+	}
+}
+
+func TestMatchGlobSurroundingStars(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"*/scratchpad/*", "/home/u/scratchpad/run1", true},
+		{"*/scratchpad/*", "/home/u/notes", false},
+		{"/tmp/*", "/tmp/x", true},
+		{"/tmp/*", "/var/tmp/x", false},
+	}
+	for _, tc := range cases {
+		if got := matchGlob(tc.pattern, tc.s); got != tc.want {
+			t.Errorf("matchGlob(%q, %q) = %v, want %v", tc.pattern, tc.s, got, tc.want)
+		}
+	}
+}
+
+func TestLoadAllMetaBadRootPatternIsAnError(t *testing.T) {
+	// An unclosed "[" in the root makes the glob pattern malformed, which
+	// filepath.Glob reports before touching the disk.
+	p := Paths{Root: filepath.Join(t.TempDir(), "[")}
+	if _, err := p.LoadAllMeta(); err == nil {
+		t.Fatal("expected an error for a malformed glob pattern")
+	}
+}
+
+func TestLoadFacets(t *testing.T) {
+	const id = "sess-1"
+	type file struct{ dir, body string }
+	cases := []struct {
+		name     string
+		files    []file
+		dirs     []string // paths under Root created as directories
+		wantGoal string
+		wantSrc  string
+	}{
+		{
+			name:     "canonical is preferred over builtin",
+			files:    []file{{"weekly-facets", `{"underlying_goal":"ours"}`}, {"facets", `{"underlying_goal":"theirs"}`}},
+			wantGoal: "ours",
+			wantSrc:  SourceCanonical,
+		},
+		{
+			name:     "builtin is used when canonical is absent",
+			files:    []file{{"facets", `{"underlying_goal":"theirs"}`}},
+			wantGoal: "theirs",
+			wantSrc:  SourceBuiltin,
+		},
+		{
+			name:     "corrupt canonical falls back to builtin",
+			files:    []file{{"weekly-facets", "{not json"}, {"facets", `{"underlying_goal":"theirs"}`}},
+			wantGoal: "theirs",
+			wantSrc:  SourceBuiltin,
+		},
+		{
+			name:     "unreadable canonical falls back to builtin",
+			files:    []file{{"facets", `{"underlying_goal":"theirs"}`}},
+			dirs:     []string{filepath.Join("weekly-facets", id+".json")},
+			wantGoal: "theirs",
+			wantSrc:  SourceBuiltin,
+		},
+		{
+			name:  "corrupt everywhere is nothing",
+			files: []file{{"weekly-facets", "{"}, {"facets", "["}},
+		},
+		{
+			name: "neither exists",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Paths{Root: t.TempDir()}
+			for _, d := range tc.dirs {
+				if err := os.MkdirAll(filepath.Join(p.Root, d), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, f := range tc.files {
+				dir := filepath.Join(p.Root, f.dir)
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, id+".json"), []byte(f.body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f, src := p.LoadFacets(id)
+			if src != tc.wantSrc {
+				t.Errorf("source = %q, want %q", src, tc.wantSrc)
+			}
+			if tc.wantSrc == "" {
+				if f != nil {
+					t.Errorf("facets = %+v, want nil", f)
+				}
+				return
+			}
+			if f == nil || f.UnderlyingGoal != tc.wantGoal {
+				t.Errorf("facets = %+v, want goal %q", f, tc.wantGoal)
+			}
+		})
+	}
+}
+
+func TestTranscriptPath(t *testing.T) {
+	const id = "sess-2"
+	cases := []struct {
+		name  string
+		home  func(t *testing.T) string
+		files []string // relative to the projects directory
+		want  string   // relative to the projects directory, "" for none
+	}{
+		{
+			name:  "found under its project directory",
+			home:  func(t *testing.T) string { return t.TempDir() },
+			files: []string{"-work-app/" + id + ".jsonl", "-work-app/other.jsonl"},
+			want:  "-work-app/" + id + ".jsonl",
+		},
+		{
+			name:  "not found",
+			home:  func(t *testing.T) string { return t.TempDir() },
+			files: []string{"-work-app/other.jsonl"},
+		},
+		{
+			name:  "a transcript at the top level is not a match",
+			home:  func(t *testing.T) string { return t.TempDir() },
+			files: []string{id + ".jsonl"},
+		},
+		{
+			name: "malformed home pattern finds nothing",
+			home: func(t *testing.T) string { return filepath.Join(t.TempDir(), "[") },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Paths{ClaudeHome: tc.home(t)}
+			for _, f := range tc.files {
+				path := filepath.Join(p.Transcripts(), filepath.FromSlash(f))
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := ""
+			if tc.want != "" {
+				want = filepath.Join(p.Transcripts(), filepath.FromSlash(tc.want))
+			}
+			if got := p.TranscriptPath(id); got != want {
+				t.Errorf("TranscriptPath = %q, want %q", got, want)
+			}
+		})
+	}
+}
