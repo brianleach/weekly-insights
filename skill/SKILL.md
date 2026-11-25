@@ -17,6 +17,11 @@ own `claude -p /insights` against it, and copies the resulting report to
 sections and format, restricted to the window. Do not summarize it back to the user
 unless asked: they read it themselves.
 
+For the full picture of a week (the report plus facet extraction, the snapshot, the
+weekly and trend pages and the failures summary in one bundle directory), run
+`weekly-insights week --days 7 --open` instead. Add `--progress` only when the user
+asks for the progress memo, since it sends their global CLAUDE.md to the model.
+
 Install if missing:
 
 ```bash

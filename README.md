@@ -138,6 +138,32 @@ are the same thing spelled out. Flags:
 - `--include-scratch` disable the project exclusions described below
 - `--config FILE` exclusion config; `--claude PATH` Claude Code binary (default `claude`)
 
+## One command for the week
+
+```
+weekly-insights week --days 7            # the whole week, one bundle
+weekly-insights week --days 7 --progress # and the progress memo
+```
+
+`week` runs every step in order: the insights report, `extract` (with its bounds:
+`--limit`, `--all`, `--concurrency`, `--timeout`, `--budget`), `validate --fix` on
+the weekly facets, `aggregate` (snapshot saved, failures included), the weekly page
+against the previous snapshot, the trend page, and the `failures` summary. It writes
+them into one directory, `<out>/week-<days>d-<end>/` (`--out` defaults to
+`~/claude-weekly-insights`, where the insights report itself also lands), with an
+`index.html` linking each file and showing each step's status, and a `bundle.json`
+listing the window, each step as `ok`, `skipped` or `failed` with a one-line reason,
+the file names and the tool version. The directory is 0700 and every file in it
+0600. A rerun for the same window builds the new bundle beside the old one and
+renames it into place, so a reader never sees half a week.
+
+A failed step does not hide the others: a failed insights run still aggregates, and
+a failed extract still aggregates the facets already on disk and says so. The
+command exits nonzero if any step failed, and its last line of output is always the
+index path. `--skip-insights --skip-extract` runs offline. `--progress` is off by
+default because the memo sends your global `CLAUDE.md` to the model (see below); it
+runs only once two or more weekly reports exist. `--open` opens the index.
+
 ## Trends across weeks
 
 The builtin has no memory between runs, so it cannot tell you whether last week's
@@ -258,7 +284,7 @@ user typed, verbatim.
 | `~/.claude/CLAUDE.md` | you | your global instructions; read by `progress` and **sent to the model** |
 | `~/.claude/usage-data/weekly-facets/` | this tool | canonical-vocabulary facets |
 | `~/.claude/usage-data/weekly/` | this tool | snapshots |
-| `~/claude-weekly-insights/` | this tool | weekly reports and the `progress` memo |
+| `~/claude-weekly-insights/` | this tool | weekly reports, the `progress` memo and `week` bundles |
 
 Sensitive outputs are written with restrictive permissions: staged transcripts,
 prepared transcripts, reports, snapshots and the progress memo are files of mode
@@ -270,7 +296,9 @@ into a symlink is replaced rather than written through.
 ### Network and what leaves your machine
 
 Three commands make network calls, all by running your installed Claude Code
-(`claude -p`) on your own subscription. Every other command is local only.
+(`claude -p`) on your own subscription, and `week` runs those same three (the
+insights report and `extract` unless skipped, `progress` only with `--progress`).
+Every other command is local only.
 
 **The default report** (`weekly-insights --days N`, also spelled `run`) runs the
 builtin `/insights` against the staged config directory.
