@@ -189,9 +189,17 @@ The first time through:
    (`--out` is required; `--all` renders every substantive session, `--limit N` caps).
    The files are 0600 in a 0700 directory; treat them as sensitive and delete them
    when you are done.
-3. Run the extraction. Either use the skill in `skill/` from Claude Code, which fans
-   the transcripts out to subagents, or run `weekly-insights prompt` yourself and
-   feed each transcript to a model by hand. Every result must be written as
+3. Run the extraction. The simplest way is `weekly-insights extract --days 7`, which
+   sends each session that still needs canonical facets to your own `claude -p`, one
+   session per call, runs `validate --fix` on every reply in a private scratch
+   directory, and moves only clean files into place. It is bounded: `--limit N`
+   (default 20; `--all` lifts it), `--concurrency N` (default 2, at most 4),
+   `--timeout` per session (default 3m), `--budget` for the whole run (default 30m),
+   and it stops after three failed calls in a row. `--dry-run` lists the worklist
+   without calling the model, and `--force` replaces facets that already exist.
+   Alternatively use the skill in `skill/` from Claude Code, which fans the
+   transcripts out to subagents, or run `weekly-insights prompt` yourself and feed
+   each transcript to a model by hand. Every result must be written as
    `~/.claude/usage-data/weekly-facets/<session_id>.json`, which is where `aggregate`
    looks.
 4. `weekly-insights validate --fix` enforces the vocabulary on those files
@@ -261,7 +269,7 @@ into a symlink is replaced rather than written through.
 
 ### Network and what leaves your machine
 
-Two commands make network calls, both by running your installed Claude Code
+Three commands make network calls, all by running your installed Claude Code
 (`claude -p`) on your own subscription. Every other command is local only.
 
 **The default report** (`weekly-insights --days N`, also spelled `run`) runs the
@@ -279,6 +287,13 @@ project names) plus their cached metadata.
   characters.** If that file holds anything you do not want sent to the model, do
   not run `progress`.
 - the numeric trend table, when snapshots exist
+
+**`extract`** sends, on stdin, one session per call: the rendered transcript of
+each session in the window that lacks canonical facets (your prompts and the
+assistant's replies, truncated per turn, plus the session id, start time and
+project path), with the embedded extraction prompt (`weekly-insights prompt`) as
+the instructions. At most `--limit` sessions per run; `--dry-run` shows which
+ones without sending anything.
 
 Nothing else in the tool makes a network request, and the tool itself uploads
 nothing anywhere.
