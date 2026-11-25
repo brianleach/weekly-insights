@@ -69,6 +69,7 @@ Commands:
   select      show what is in the window and how many sessions need facets
   failures    classify every failed tool call in the window (--json for the data)
   prepare     render the window's transcripts to text for facet extraction
+  extract     extract canonical facets headless through claude -p, validated
   aggregate   build and save a snapshot of the window
   report      render the newest snapshot, diffed against the previous one
               (--html for a browsable page, --out DIR for one file per week)
@@ -114,6 +115,8 @@ func main() {
 		err = cmdFailures(os.Args[2:])
 	case "prepare":
 		err = cmdPrepare(os.Args[2:])
+	case "extract":
+		err = cmdExtract(os.Args[2:])
 	case "aggregate":
 		err = cmdAggregate(os.Args[2:])
 	case "report":

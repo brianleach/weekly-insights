@@ -61,6 +61,16 @@ weekly-insights select --days 7
 ### 2. Extract facets
 
 ```bash
+weekly-insights extract --days 7
+```
+
+This runs each session through `claude -p` and lands only facets that pass
+`validate --fix`. Add `--dry-run` first to see the worklist, `--all` to go past
+the default cap of 20.
+
+Alternatively, extract by hand from this session:
+
+```bash
 WORK=$(mktemp -d)
 weekly-insights prepare --days 7 --out "$WORK"
 ```
