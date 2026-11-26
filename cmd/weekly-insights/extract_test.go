@@ -72,3 +72,21 @@ func TestCmdExtract(t *testing.T) {
 		t.Errorf("want a not-logged-in error, got %v", err)
 	}
 }
+
+func TestCmdExtractRejectsBadEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TMPDIR", t.TempDir())
+
+	// A usable root, so the unparsable --end is the only thing left to fail on.
+	root := filepath.Join(home, ".claude", "usage-data")
+	if err := os.MkdirAll(filepath.Join(root, "session-meta"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdExtract([]string{"--root", root, "--days", "7", "--end", "not-a-date"}); err == nil {
+		t.Fatal("want an error from an unparsable --end, got nil")
+	}
+	if m, _ := filepath.Glob(filepath.Join(root, "weekly-facets", "*")); len(m) != 0 {
+		t.Fatalf("a rejected --end still wrote %v", m)
+	}
+}
