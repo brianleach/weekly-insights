@@ -64,6 +64,8 @@ Usage:
   weekly-insights <command> [flags]
 
 Commands:
+  week        the whole week in one bundle: insights, extract, validate,
+              aggregate, weekly and trend pages, failures (--progress adds the memo)
   progress    judge progression across the last N weekly reports (separate file)
   auth        store the token insights needs (--check to verify, --clear to remove)
   select      show what is in the window and how many sessions need facets
@@ -117,6 +119,8 @@ func main() {
 		err = cmdPrepare(os.Args[2:])
 	case "extract":
 		err = cmdExtract(os.Args[2:])
+	case "week":
+		err = cmdWeek(os.Args[2:])
 	case "aggregate":
 		err = cmdAggregate(os.Args[2:])
 	case "report":
@@ -200,34 +204,55 @@ func cmdInsights(args []string) error {
 	if err != nil {
 		return err
 	}
-	home, err := os.UserHomeDir()
+	// Ctrl-C and SIGTERM cancel the run instead of killing the process, so the
+	// stage is still removed on the way out. A signal during the child run
+	// stops the child too, through the context handed to the runner.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	report, err := runInsights(ctx, p, o, insightsOpts{outDir: *outDir, keep: *keep, claudeBin: *claudeBin})
 	if err != nil {
 		return err
 	}
-	if *outDir == "" {
-		*outDir = filepath.Join(home, "claude-weekly-insights")
+	fmt.Println(report)
+	if *openIt {
+		openPath(report)
+	}
+	return nil
+}
+
+// insightsOpts are the insights run's settings beyond the window.
+type insightsOpts struct {
+	outDir    string // default ~/claude-weekly-insights
+	keep      bool   // leave the stage in place
+	claudeBin string
+}
+
+// runInsights stages the window, runs the builtin against it, and returns the
+// path of the copied report. Progress notes go to stderr; stdout is the
+// caller's.
+func runInsights(ctx context.Context, p store.Paths, o window.Options, opt insightsOpts) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if opt.outDir == "" {
+		opt.outDir = filepath.Join(home, "claude-weekly-insights")
 	}
 
 	r, err := window.Select(p, o)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(r.Substantive) == 0 {
-		return fmt.Errorf("no substantive sessions in the last %d days", o.Days)
+		return "", fmt.Errorf("no substantive sessions in the last %d days", o.Days)
 	}
-
-	// Ctrl-C and SIGTERM cancel the run instead of killing the process, so the
-	// stage below is still removed on the way out. A signal during the child
-	// run stops the child too, through the context handed to the runner.
-	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
 
 	sweepStaleStages()
 	st, err := os.MkdirTemp("", stagePrefix)
 	if err != nil {
-		return fmt.Errorf("creating stage: %w", err)
+		return "", fmt.Errorf("creating stage: %w", err)
 	}
-	if !*keep {
+	if !opt.keep {
 		// The stage holds copies of the account file and of raw transcripts, so
 		// it is not left behind, and a failure to remove it is reported rather
 		// than swallowed: the run is no longer clean if those copies survive it.
@@ -239,7 +264,7 @@ func cmdInsights(args []string) error {
 	}
 	counts, err := stage.Build(stage.Inputs{Paths: p, AccountFile: filepath.Join(home, ".claude.json")}, r.Substantive, st)
 	if err != nil {
-		return err
+		return "", err
 	}
 	fmt.Fprintf(os.Stderr, "staged %d sessions (%d transcripts, %d meta, %d facets) for %s .. %s\n",
 		counts.Sessions, counts.Transcripts, counts.Meta, counts.Facets,
@@ -247,7 +272,7 @@ func cmdInsights(args []string) error {
 	if r.Derived > 0 {
 		fmt.Fprintf(os.Stderr, "%d session(s) had no cached metadata; derived from transcripts\n", r.Derived)
 	}
-	if *keep {
+	if opt.keep {
 		fmt.Fprintf(os.Stderr, "stage kept at %s\n", st)
 	}
 
@@ -256,22 +281,14 @@ func cmdInsights(args []string) error {
 	token, _ := auth.Resolve()
 	res, err := runner.Run(runner.Options{
 		Ctx:  ctx,
-		Real: p, Stage: st, ClaudeBin: *claudeBin, Token: token,
-		OutPath: filepath.Join(*outDir, name), Stderr: os.Stderr,
+		Real: p, Stage: st, ClaudeBin: opt.claudeBin, Token: token,
+		OutPath: filepath.Join(opt.outDir, name), Stderr: os.Stderr,
 	})
 	if err == runner.ErrNotLoggedIn {
-		return fmt.Errorf(`%w
-
-A staged config directory cannot see the login stored for the real one, so the
-child needs a long-lived token minted on your subscription. One-time setup:
-
-  1. in another terminal:  claude setup-token
-  2. then here:            weekly-insights auth      (paste the token it printed)
-
-%s in the environment also works for a single run.`, err, auth.EnvVar)
+		return "", withSetupHelp(err)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	fmt.Fprintf(os.Stderr, "harvested %d session-meta and %d facet files into the real cache\n",
 		res.HarvestedMeta, res.HarvestedFacets)
@@ -280,11 +297,20 @@ child needs a long-lived token minted on your subscription. One-time setup:
 		fmt.Fprintf(os.Stderr, "warning: %d cache files could not be copied into the real cache\n",
 			res.HarvestErrors)
 	}
-	fmt.Println(res.Report)
-	if *openIt {
-		openPath(res.Report)
-	}
-	return nil
+	return res.Report, nil
+}
+
+// withSetupHelp explains the one-time token setup a staged run needs.
+func withSetupHelp(err error) error {
+	return fmt.Errorf(`%w
+
+A staged config directory cannot see the login stored for the real one, so the
+child needs a long-lived token minted on your subscription. One-time setup:
+
+  1. in another terminal:  claude setup-token
+  2. then here:            weekly-insights auth      (paste the token it printed)
+
+%s in the environment also works for a single run.`, err, auth.EnvVar)
 }
 
 // cmdProgress reads the raw weekly reports and asks for a progression memo.
@@ -313,21 +339,45 @@ func cmdProgress(args []string) error {
 		*reportsDir = filepath.Join(home, "claude-weekly-insights")
 	}
 
-	paths, err := progress.Discover(*reportsDir)
+	in, err := progressInput(*reportsDir, *weeks, *root, home)
 	if err != nil {
 		return err
 	}
-	if len(paths) < 2 {
-		return fmt.Errorf("need at least two weekly reports in %s to judge progression; found %d (run \"weekly-insights --days 7\" for this week and add --end YYYY-MM-DD for past weeks)", *reportsDir, len(paths))
+	if *dryRun {
+		fmt.Println(progress.Instructions())
+		fmt.Println()
+		fmt.Print(in.Text())
+		return nil
 	}
-	if len(paths) > *weeks {
-		paths = paths[len(paths)-*weeks:]
+	out, err := writeProgressMemo(in, *reportsDir, *claudeBin)
+	if err != nil {
+		return err
 	}
+	fmt.Println(out)
+	if *openIt {
+		openPath(out)
+	}
+	return nil
+}
+
+// progressInput reads the newest weeks reports in reportsDir, with the
+// adopted CLAUDE.md and the numeric trend as context.
+func progressInput(reportsDir string, weeks int, root, home string) (progress.Input, error) {
 	in := progress.Input{}
+	paths, err := progress.Discover(reportsDir)
+	if err != nil {
+		return in, err
+	}
+	if len(paths) < 2 {
+		return in, fmt.Errorf("need at least two weekly reports in %s to judge progression; found %d (run \"weekly-insights --days 7\" for this week and add --end YYYY-MM-DD for past weeks)", reportsDir, len(paths))
+	}
+	if len(paths) > weeks {
+		paths = paths[len(paths)-weeks:]
+	}
 	for _, p := range paths {
 		w, err := progress.Extract(p)
 		if err != nil {
-			return err
+			return in, err
 		}
 		in.Weeks = append(in.Weeks, w)
 	}
@@ -340,25 +390,23 @@ func cmdProgress(args []string) error {
 	// The numeric trend is optional context from the snapshot supplement.
 	sp, err := store.DefaultPaths()
 	if err == nil {
-		if *root != "" {
-			sp.Root = *root
+		if root != "" {
+			sp.Root = root
 		}
 		if snaps, err := snapshot.List(sp); err == nil && len(snaps) > 1 {
 			in.Trend = report.Trend(snaps)
 		}
 	}
+	return in, nil
+}
 
-	if *dryRun {
-		fmt.Println(progress.Instructions())
-		fmt.Println()
-		fmt.Print(in.Text())
-		return nil
-	}
-
+// writeProgressMemo asks the model for the memo and writes it beside the
+// reports, returning its path.
+func writeProgressMemo(in progress.Input, reportsDir, claudeBin string) (string, error) {
 	fmt.Fprintf(os.Stderr, "comparing %d weekly reports (%s .. %s) with the default model ...\n",
 		len(in.Weeks), in.Weeks[0].Label, in.Weeks[len(in.Weeks)-1].Label)
 	token, _ := auth.Resolve()
-	memo, raw, err := progress.Run(in, progress.Options{ClaudeBin: *claudeBin, Token: token, Stderr: os.Stderr})
+	memo, raw, err := progress.Run(in, progress.Options{ClaudeBin: claudeBin, Token: token, Stderr: os.Stderr})
 	switch {
 	case errors.Is(err, progress.ErrParse):
 		// The process succeeded, so its reply is still the model's answer; the
@@ -366,20 +414,16 @@ func cmdProgress(args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: %v; writing the raw reply instead\n", err)
 	case err != nil:
 		// Anything else, including a failed child, is a failed command.
-		return err
+		return "", err
 	}
 	last := in.Weeks[len(in.Weeks)-1]
-	out := filepath.Join(*reportsDir, fmt.Sprintf("progress-%dd-%s.html", last.Days, last.Label))
+	out := filepath.Join(reportsDir, fmt.Sprintf("progress-%dd-%s.html", last.Days, last.Label))
 	// The memo quotes the weekly reports, so it gets the same owner-only
 	// treatment they do.
 	if err := writeSensitive(out, []byte(progress.Render(memo, raw, in))); err != nil {
-		return fmt.Errorf("writing memo: %w", err)
+		return "", fmt.Errorf("writing memo: %w", err)
 	}
-	fmt.Println(out)
-	if *openIt {
-		openPath(out)
-	}
-	return nil
+	return out, nil
 }
 
 // cmdAuth stores the token once so the README setup is two lines instead of a
