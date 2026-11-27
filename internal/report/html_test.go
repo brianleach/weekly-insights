@@ -89,24 +89,110 @@ func TestWeeklyHTMLNoEmDash(t *testing.T) {
 	}
 }
 
-func TestTrendHTMLOneCardPerMetricOneBarPerWeek(t *testing.T) {
+func TestTrendHTMLOneChartPerCard(t *testing.T) {
 	a, b := base(), base()
 	a.Window.Label, b.Window.Label = "2026-09-04", "2026-09-11"
 	got := TrendHTML([]snapshot.Snapshot{a, b})
 
-	wantCards := len(tracked) + 1 // plus the sessions card
+	wantCards := len(tracked) + 3 // sessions, failures per session, self-inflicted share
 	if n := strings.Count(got, `class="chart-card"`); n != wantCards {
 		t.Errorf("expected %d chart cards, got %d", wantCards, n)
 	}
-	// Two weeks means two bars per card.
-	if n := strings.Count(got, `class="bar-row`); n != wantCards*2 {
-		t.Errorf("expected %d bar rows, got %d", wantCards*2, n)
+	if n := strings.Count(got, `<svg `); n != wantCards {
+		t.Errorf("expected one svg per card, got %d", n)
 	}
-	if !strings.Contains(got, `bar-row latest`) {
-		t.Error("latest week should be highlighted")
+	for _, gone := range []string{"<table", `class="bar-row`, "<script"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("trend page must not contain %q", gone)
+		}
 	}
-	if strings.Contains(got, "<table") {
-		t.Error("trend must not use tables")
+	// Neither week has failures, so those two cards draw no points at all.
+	if n := strings.Count(got, "<circle"); n != (len(tracked)+1)*2 {
+		t.Errorf("expected two points per card with data, got %d circles", n)
+	}
+	if !strings.Contains(got, "Friction events / session <span class=\"chart-better\">&darr; better</span>") ||
+		!strings.Contains(got, "Fully or mostly achieved <span class=\"chart-better\">&uarr; better</span>") {
+		t.Error("expected each rate card to say which direction is better")
+	}
+}
+
+func TestTrendHTMLFailureCards(t *testing.T) {
+	a, b := base(), base()
+	a.Window.Label = "2026-09-04"
+	a.Rates[snapshot.RateIgnoredPreference] = 0.1 // so the only possible zero is a failures one
+	b.Failures = &snapshot.FailureSummary{Total: 8, PerSession: 0.5, SelfInflicted: 2, External: 6}
+	got := TrendHTML([]snapshot.Snapshot{a, b})
+	for _, want := range []string{"<title>Failures / session</title>", "<title>Sep 11: 0.50</title>", "<title>Sep 11: 25.0%</title>"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if strings.Contains(got, "<title>Sep 4: 0</title>") {
+		t.Error("a week without a failures block must be a gap, not a zero")
+	}
+}
+
+func TestTrendHTMLMarksFacetSourceBoundary(t *testing.T) {
+	week := func(label string, src map[string]int) snapshot.Snapshot {
+		s := base()
+		s.Window.Label = label
+		s.Sessions.FacetSource = src
+		return s
+	}
+	builtin, canonical := map[string]int{"builtin": 9, "canonical": 1}, map[string]int{"canonical": 7}
+	cards := len(tracked) + 3
+
+	same := TrendHTML([]snapshot.Snapshot{week("2026-09-04", builtin), week("2026-09-11", builtin), week("2026-09-18", nil)})
+	if strings.Contains(same, "facet source changed") || strings.Contains(same, "Facet source changed") {
+		t.Error("no source change: expected no annotation and no warning")
+	}
+
+	got := TrendHTML([]snapshot.Snapshot{
+		week("2026-09-04", builtin), week("2026-09-11", builtin), week("2026-09-18", nil), week("2026-09-25", canonical),
+	})
+	if n := strings.Count(got, ">facet source changed</text>"); n != cards {
+		t.Errorf("expected the boundary on every chart (%d), got %d", cards, n)
+	}
+	if !strings.Contains(got, "Facet source changed between the weeks ending Sep 11, 2026 (mostly builtin) and Sep 25, 2026 (mostly canonical).") {
+		t.Error("expected the warning to name the weeks on either side of the boundary")
+	}
+	// The mark sits at the fourth week, the last x position.
+	if !strings.Contains(got, `<path d="M580.0 22.0V152.0" stroke-dasharray="2 3"`) {
+		t.Error("expected the boundary line at the week the source changed")
+	}
+}
+
+func TestTrendHTMLWithAnnotations(t *testing.T) {
+	a, b := base(), base()
+	a.Window.Label = "2026-09-04"
+	got := TrendHTMLWith([]snapshot.Snapshot{a, b}, []Annotation{
+		{Week: "2026-09-11", Label: "<script>fix</script>", Metric: snapshot.RateToolErrors},
+		{Week: "2026-09-11", Label: "everywhere"},
+		{Week: "2030-01-01", Label: "no such week"},
+	})
+	if n := strings.Count(got, "&lt;script&gt;fix&lt;/script&gt;</text>"); n != 1 {
+		t.Errorf("metric annotation should appear on exactly one chart, escaped; got %d", n)
+	}
+	if strings.Contains(got, "<script>") {
+		t.Error("annotation label was not escaped")
+	}
+	if n := strings.Count(got, ">everywhere</text>"); n != len(tracked)+3 {
+		t.Errorf("an annotation with no metric belongs on every chart, got %d", n)
+	}
+	if strings.Contains(got, "no such week") {
+		t.Error("an annotation for an unknown week must be dropped")
+	}
+	if TrendHTMLWith([]snapshot.Snapshot{a, b}, nil) != TrendHTML([]snapshot.Snapshot{a, b}) {
+		t.Error("TrendHTML must equal TrendHTMLWith with no annotations")
+	}
+}
+
+func TestDominantSourceTieIsStable(t *testing.T) {
+	if got := dominantSource(map[string]int{"canonical": 3, "builtin": 3}); got != "builtin" {
+		t.Errorf("tie should go to the alphabetically first source, got %q", got)
+	}
+	if got := dominantSource(map[string]int{"builtin": 0}); got != "" {
+		t.Errorf("zero counts mean no source, got %q", got)
 	}
 }
 
@@ -162,8 +248,8 @@ func TestTrendHTMLEscapesUnparseableWeekLabel(t *testing.T) {
 	a.Window.Label = "not a <date> label"
 	got := TrendHTML([]snapshot.Snapshot{a})
 
-	if !strings.Contains(got, `<div class="bar-label">not a &lt;date&gt; label</div>`) {
-		t.Error("unparseable week label should be shown escaped as the bar label")
+	if !strings.Contains(got, `>not a &lt;date&gt; label</text>`) {
+		t.Error("unparseable week label should be shown escaped as the axis label")
 	}
 	if strings.Contains(got, "<date>") {
 		t.Error("week label was not escaped")

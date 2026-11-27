@@ -139,9 +139,60 @@ func WeeklyHTML(cur snapshot.Snapshot, prev *snapshot.Snapshot) string {
 	return b.String()
 }
 
-// TrendHTML renders every snapshot as one page of per-metric bar charts,
+// Annotation marks a week on the trend charts, for example the week a fix was
+// applied. Week is a snapshot's Window.Label; Metric is a card key (a rate key
+// from internal/snapshot, or "sessions", "failures_per_session",
+// "self_inflicted_pct"), and empty means every chart. An annotation whose week
+// matches no snapshot is dropped.
+type Annotation struct {
+	Week   string
+	Label  string
+	Metric string
+}
+
+// trendCard is one chart on the trend page.
+type trendCard struct {
+	key, label string
+	down       bool // lower is better
+	arrow      bool // false for counts that have no better direction
+	suffix     string
+	get        func(snapshot.Snapshot) point
+}
+
+func trendCards() []trendCard {
+	cards := []trendCard{{key: "sessions", label: "Sessions", get: func(s snapshot.Snapshot) point {
+		return point{float64(s.Sessions.Substantive), true}
+	}}}
+	for _, m := range tracked {
+		cards = append(cards, trendCard{key: m.key, label: m.label, down: m.down, arrow: true, suffix: m.suffix,
+			get: func(s snapshot.Snapshot) point { v, ok := s.Rates[m.key]; return point{v, ok} }})
+	}
+	// Snapshots from before failures were counted have no block; that week is
+	// a gap, not a zero.
+	cards = append(cards,
+		trendCard{key: "failures_per_session", label: "Failures / session", down: true, arrow: true,
+			get: func(s snapshot.Snapshot) point {
+				if s.Failures == nil {
+					return point{}
+				}
+				return point{s.Failures.PerSession, true}
+			}},
+		trendCard{key: "self_inflicted_pct", label: "Self-inflicted share of failures", down: true, arrow: true, suffix: "%",
+			get: func(s snapshot.Snapshot) point {
+				if s.Failures == nil || s.Failures.Total == 0 {
+					return point{}
+				}
+				return point{round2(100 * float64(s.Failures.SelfInflicted) / float64(s.Failures.Total)), true}
+			}})
+	return cards
+}
+
+// TrendHTML renders every snapshot as one page of per-metric line charts,
 // oldest week first, so a metric's shape over time is visible at a glance.
-func TrendHTML(snaps []snapshot.Snapshot) string {
+func TrendHTML(snaps []snapshot.Snapshot) string { return TrendHTMLWith(snaps, nil) }
+
+// TrendHTMLWith is TrendHTML with extra annotations drawn on the charts.
+func TrendHTMLWith(snaps []snapshot.Snapshot, notes []Annotation) string {
 	var b strings.Builder
 	pageOpen(&b, "Weekly Trend")
 	b.WriteString("<h1>Weekly Trend</h1>\n")
@@ -154,78 +205,96 @@ func TrendHTML(snaps []snapshot.Snapshot) string {
 		len(snaps), longDate(snaps[0].Window.Start), longDate(snaps[len(snaps)-1].Window.End))
 
 	total := 0
-	for _, s := range snaps {
+	weeks := make([]string, len(snaps))
+	index := map[string]int{}
+	for i, s := range snaps {
 		total += s.Sessions.Substantive
+		weeks[i] = shortDate(s.Window.Label)
+		index[s.Window.Label] = i
 	}
 	stats(&b, []stat{{fmt.Sprint(len(snaps)), "weeks"}, {fmt.Sprint(total), "sessions"}})
-	b.WriteString("<p class=\"section-intro\">One card per metric, one bar per week. Bars are scaled to the largest week for that metric. Lower is better for everything except the last card.</p>\n")
-	b.WriteString("<div class=\"charts-row\">\n")
 
-	// Sessions is a count rather than a rate, so it gets its own card instead
-	// of going through weekMetric.
-	sessionsCard(&b, snaps)
-
-	weekMetric := func(label, key, color string, isPct bool) {
-		fmt.Fprintf(&b, "<div class=\"chart-card\"><div class=\"chart-title\">%s</div>\n", esc(label))
-		max := 0.0
-		for _, s := range snaps {
-			if v := s.Rates[key]; v > max {
-				max = v
-			}
+	bounds := facetBoundaries(snaps)
+	all := make([]Annotation, 0, len(bounds)+len(notes))
+	if len(bounds) > 0 {
+		parts := make([]string, len(bounds))
+		for i, fb := range bounds {
+			all = append(all, Annotation{Week: snaps[fb.to].Window.Label, Label: "facet source changed"})
+			parts[i] = fmt.Sprintf("the weeks ending %s (mostly %s) and %s (mostly %s)",
+				longDate(snaps[fb.from].Window.Label), esc(fb.fromSrc), longDate(snaps[fb.to].Window.Label), esc(fb.toSrc))
 		}
-		for i, s := range snaps {
-			v, ok := s.Rates[key]
-			w := 0.0
-			if ok && max > 0 {
-				w = 100 * v / max
-			}
-			cls := ""
-			if i == len(snaps)-1 {
-				cls = " latest"
-			}
-			val := fmtOpt(v, ok, "")
-			if isPct {
-				val = fmtOpt(v, ok, "%")
-			}
-			fmt.Fprintf(&b, "<div class=\"bar-row%s\"><div class=\"bar-label\">%s</div><div class=\"bar-track\"><div class=\"bar-fill\" style=\"width:%.1f%%;background:%s\"></div></div><div class=\"bar-value\">%s</div></div>\n",
-				cls, shortDate(s.Window.Label), w, color, val)
-		}
-		b.WriteString("</div>\n")
+		fmt.Fprintf(&b, "<div class=\"narrative\"><p>Facet source changed between %s. The charts mark it. Read a jump across that line as a change in extraction before reading it as a change in how you work.</p></div>\n",
+			strings.Join(parts, "; and between "))
 	}
-	for _, m := range tracked {
-		color := "#dc2626"
-		if !m.down {
-			color = "#16a34a"
+	all = append(all, notes...)
+
+	b.WriteString("<p class=\"section-intro\">One card per metric, one point per week, oldest first. The dashed line is the mean of the four weeks before the latest; a gap is a week with no value.</p>\n")
+	b.WriteString("<div class=\"charts-row\">\n")
+	for _, c := range trendCards() {
+		pts := make([]point, len(snaps))
+		for i, s := range snaps {
+			pts[i] = c.get(s)
 		}
-		weekMetric(m.label, m.key, color, m.suffix == "%")
+		var marks []mark
+		for _, a := range all {
+			if i, ok := index[a.Week]; ok && (a.Metric == "" || a.Metric == c.key) {
+				marks = append(marks, mark{index: i, label: a.Label})
+			}
+		}
+		better := ""
+		if c.arrow {
+			better = " <span class=\"chart-better\">&uarr; better</span>"
+			if c.down {
+				better = " <span class=\"chart-better\">&darr; better</span>"
+			}
+		}
+		fmt.Fprintf(&b, "<div class=\"chart-card\"><div class=\"chart-title\">%s%s</div>\n%s\n</div>\n",
+			esc(c.label), better, lineChart([]series{{name: c.label, points: pts}},
+				chartOpts{title: c.label, weeks: weeks, suffix: c.suffix, marks: marks}))
 	}
 	b.WriteString("</div>\n")
-	b.WriteString("<div class=\"narrative\"><p>Weeks are only comparable when their facets came from the same extraction. Check <code>sessions.facet_source</code> in each snapshot before reading a jump across that boundary as a real change.</p></div>\n")
 	pageClose(&b)
 	return b.String()
 }
 
-func sessionsCard(b *strings.Builder, snaps []snapshot.Snapshot) {
-	b.WriteString("<div class=\"chart-card\"><div class=\"chart-title\">Sessions</div>\n")
-	max := 0
-	for _, s := range snaps {
-		if s.Sessions.Substantive > max {
-			max = s.Sessions.Substantive
-		}
-	}
+// facetBoundary is a change of dominant facet source between two weeks, from
+// and to being snapshot indexes.
+type facetBoundary struct {
+	from, to       int
+	fromSrc, toSrc string
+}
+
+// facetBoundaries compares each week's dominant facet source with the last
+// week that had one. A week with no facets says nothing about the source, so
+// it neither starts nor ends a boundary.
+func facetBoundaries(snaps []snapshot.Snapshot) []facetBoundary {
+	var out []facetBoundary
+	last := -1
 	for i, s := range snaps {
-		w := 0.0
-		if max > 0 {
-			w = 100 * float64(s.Sessions.Substantive) / float64(max)
+		src := dominantSource(s.Sessions.FacetSource)
+		if src == "" {
+			continue
 		}
-		cls := ""
-		if i == len(snaps)-1 {
-			cls = " latest"
+		if last >= 0 {
+			if prev := dominantSource(snaps[last].Sessions.FacetSource); prev != src {
+				out = append(out, facetBoundary{from: last, to: i, fromSrc: prev, toSrc: src})
+			}
 		}
-		fmt.Fprintf(b, "<div class=\"bar-row%s\"><div class=\"bar-label\">%s</div><div class=\"bar-track\"><div class=\"bar-fill\" style=\"width:%.1f%%;background:#2563eb\"></div></div><div class=\"bar-value\">%d</div></div>\n",
-			cls, shortDate(s.Window.Label), w, s.Sessions.Substantive)
+		last = i
 	}
-	b.WriteString("</div>\n")
+	return out
+}
+
+// dominantSource is the source with the most sessions, ties going to the
+// alphabetically first so map order never decides it.
+func dominantSource(m map[string]int) string {
+	best, n := "", 0
+	for k, v := range m {
+		if v > n || (v == n && v > 0 && k < best) {
+			best, n = k, v
+		}
+	}
+	return best
 }
 
 // --- building blocks -------------------------------------------------------
@@ -325,10 +394,11 @@ func longDate(s string) string {
 	return t.Format("Jan 2, 2006")
 }
 
+// shortDate returns plain text; the caller escapes it.
 func shortDate(s string) string {
 	t, err := time.Parse("2006-01-02", dateOnly(s))
 	if err != nil {
-		return esc(s)
+		return s
 	}
 	return t.Format("Jan 2")
 }
@@ -402,6 +472,8 @@ h2 .count { font-size: 13px; font-weight: 600; color: #64748b; background: #f1f5
 .friction-examples strong { color: #7f1d1d; }
 .empty { color: #94a3b8; font-size: 13px; }
 .footnote { margin-top: 40px; font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 16px; }
+.chart-better { font-weight: 400; text-transform: none; color: #94a3b8; margin-left: 6px; }
+.line-chart { display: block; width: 100%; height: auto; }
 code { font-family: monospace; font-size: 12px; background: #f1f5f9; padding: 1px 5px; border-radius: 3px; }
 @media (max-width: 640px) { .charts-row { grid-template-columns: 1fr; } .stats-row { justify-content: center; } body { padding: 24px 16px; } }
 `

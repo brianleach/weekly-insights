@@ -241,7 +241,7 @@ Flags for `report`:
   to compare against (default the one before)
 - `--trend` every snapshot as one table
 - `--html` render a standalone page; with `--out DIR`, write one page per snapshot plus
-  `trend.html` into that directory
+  `trend.html` (one inline SVG line chart per metric, no scripts) into that directory
 - `--root DIR` usage-data directory
 
 ### Failed tool calls
