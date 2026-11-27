@@ -135,7 +135,7 @@ func TestCmdWeekHappyPath(t *testing.T) {
 	}
 	t.Logf("bundle tree:\n%v  %s/\n  %s", fi.Mode(), filepath.Base(dir), strings.Join(tree, "\n  "))
 
-	want := []string{"bundle.json", "failures.txt", "index.html", "insights-7d-2026-01-10.html",
+	want := []string{"bundle.json", "coach.html", "failures.txt", "index.html", "insights-7d-2026-01-10.html",
 		"progress.html", "trend.html", "weekly.html"}
 	m := readBundle(t, dir)
 	if strings.Join(m.Files, ",") != strings.Join(want, ",") {
@@ -151,7 +151,7 @@ func TestCmdWeekHappyPath(t *testing.T) {
 			t.Errorf("step %s = %s", name, st)
 		}
 	}
-	if len(m.Steps) != 8 || m.Window.End != "2026-01-10" || m.Window.Days != 7 || m.Version == "" {
+	if len(m.Steps) != 9 || m.Window.End != "2026-01-10" || m.Window.Days != 7 || m.Version == "" {
 		t.Errorf("bundle.json = %+v", m)
 	}
 	idx, _ := os.ReadFile(filepath.Join(dir, "index.html"))
@@ -216,8 +216,8 @@ func TestCmdWeekOfflineAndRerun(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	sort.Strings(names)
-	if strings.Join(names, ",") != "week-7d-2026-01-10" {
-		t.Errorf("out dir after rerun = %v, want only the bundle", names)
+	if strings.Join(names, ",") != "coach,week-7d-2026-01-10" {
+		t.Errorf("out dir after rerun = %v, want only the coach proposals and the bundle", names)
 	}
 	st := statuses(readBundle(t, filepath.Join(out, "week-7d-2026-01-10")))
 	if st["insights"] != "skipped" || st["extract"] != "skipped" || st["aggregate"] != "ok" {

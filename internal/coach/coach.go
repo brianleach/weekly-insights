@@ -116,7 +116,7 @@ type Result struct {
 // rule is one pure rule. It returns its proposals and any notes.
 type rule func(cur snapshot.Snapshot, prev []snapshot.Snapshot, fs []failures.Failure) ([]Proposal, []string)
 
-var rules = []rule{ruleCorrections, ruleFriction, ruleHarness}
+var rules = []rule{ruleCorrections, ruleFriction, ruleHarness, ruleDenied, ruleShell}
 
 // Propose runs every rule and returns the ranked result.
 func Propose(in Input) Result {

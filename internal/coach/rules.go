@@ -195,6 +195,7 @@ type failureGroup struct {
 	key      string
 	count    int
 	sessions map[string]bool
+	items    []failures.Failure
 }
 
 func (g failureGroup) evidence(cur snapshot.Snapshot) Evidence {
@@ -220,6 +221,7 @@ func groupFailures(fs []failures.Failure, key func(failures.Failure) string) []f
 		}
 		g.count++
 		g.sessions[f.Session] = true
+		g.items = append(g.items, f)
 	}
 	out := make([]failureGroup, 0, len(m))
 	for _, g := range m {

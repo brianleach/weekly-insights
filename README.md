@@ -148,7 +148,8 @@ weekly-insights week --days 7 --progress # and the progress memo
 `week` runs every step in order: the insights report, `extract` (with its bounds:
 `--limit`, `--all`, `--concurrency`, `--timeout`, `--budget`), `validate --fix` on
 the weekly facets, `aggregate` (snapshot saved, failures included), the weekly page
-against the previous snapshot, the trend page, and the `failures` summary. It writes
+against the previous snapshot, the trend page, the `failures` summary, and the
+`coach` proposals as `coach.html` (see below). It writes
 them into one directory, `<out>/week-<days>d-<end>/` (`--out` defaults to
 `~/claude-weekly-insights`, where the insights report itself also lands), with an
 `index.html` linking each file and showing each step's status, and a `bundle.json`
@@ -268,6 +269,44 @@ shapes behind the classifier denials, the top 15 normalized signatures with one
 example command each, and the self-inflicted versus external split. `aggregate`
 stores the same totals in the snapshot, so `report --trend` can chart them.
 
+### Coach: proposed changes to your setup
+
+`coach` turns those measurements into ranked, concrete changes to your global
+`CLAUDE.md` and the `permissions.allow` list in your global `settings.json`. Every
+rule is deterministic, with no model call, so the same week gives the same list,
+in the same order, with the same IDs.
+
+```
+weekly-insights coach --days 7
+weekly-insights coach --days 7 --json --claude-dir /path/to/claude-config
+```
+
+Flags for `coach`: the window flags of `failures`, plus `--json` and
+`--claude-dir DIR` (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`).
+
+| Rule | Fires when | Proposes |
+|---|---|---|
+| R1 | the same correction (case, spacing and punctuation folded) in 2 sessions this window, or in this window and the previous one | a `CLAUDE.md` line quoting it |
+| R2 | an unverified-claim, unsanctioned-action or ignored-preference rate is at least 0.1 per session and has not gone down for 2 windows in a row | a fixed instruction for that friction |
+| R3 | the same harness guardrail 3 times | its fixed instruction (read before edit, no sleep chains) |
+| R4 | the same classifier-denied command 3 times | an allow rule only for a plain command on a fixed read-only list, otherwise a `CLAUDE.md` note |
+| R5 | the same self-inflicted shell signature 3 times | its fixed fix |
+
+Score is the recurrence count times the rule's weight (R1 3, R2 and R3 2, R4 and
+R5 1), ties broken by ID. A proposal whose text is already in the file is kept,
+marked `already_present` and ranked last. Each proposal's evidence says how many
+sessions it rests on. R2 stands down, with the reason printed, when any compared
+window has fewer than 10 substantive sessions or the facet source changed between
+them. R4 never proposes an allow rule for a command containing `rm`, `mv`, `chmod`,
+`chown`, `curl`, `wget`, `ssh`, `sudo`, a redirect, a pipe into a shell, `git push`,
+`git reset` or `--force`, and never for `find`, since a prefix rule would also allow
+`find -delete`.
+
+`coach` reads `CLAUDE.md` and `settings.json` and never writes to the Claude config
+directory. It writes its proposals to
+`~/claude-weekly-insights/coach/proposals-<days>d-<end>.json` (0700 directory,
+0600 file). Applying a proposal is up to you.
+
 Snapshots record per-session rates (so a busy week is not penalised), the three
 friction types that generic extractors miss (`unverified_claim`,
 `unwanted_autonomous_action`, `ignored_stated_preference`), and every correction the
@@ -281,10 +320,11 @@ user typed, verbatim.
 | `~/.claude/usage-data/session-meta/` | Claude Code | per-session counters; harvested back, never overwritten |
 | `~/.claude/usage-data/facets/` | Claude Code | cached judgments; harvested back, never overwritten |
 | `~/.claude.json` | Claude Code | account file, copied into the stage |
-| `~/.claude/CLAUDE.md` | you | your global instructions; read by `progress` and **sent to the model** |
+| `~/.claude/CLAUDE.md` | you | your global instructions; read by `progress` and **sent to the model**, and read locally by `coach` |
+| `~/.claude/settings.json` | you | read by `coach` for `permissions.allow`; never written |
 | `~/.claude/usage-data/weekly-facets/` | this tool | canonical-vocabulary facets |
 | `~/.claude/usage-data/weekly/` | this tool | snapshots |
-| `~/claude-weekly-insights/` | this tool | weekly reports, the `progress` memo and `week` bundles |
+| `~/claude-weekly-insights/` | this tool | weekly reports, the `progress` memo, `week` bundles and `coach/` proposals |
 
 Sensitive outputs are written with restrictive permissions: staged transcripts,
 prepared transcripts, reports, snapshots and the progress memo are files of mode

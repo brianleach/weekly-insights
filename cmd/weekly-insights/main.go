@@ -65,11 +65,12 @@ Usage:
 
 Commands:
   week        the whole week in one bundle: insights, extract, validate,
-              aggregate, weekly and trend pages, failures (--progress adds the memo)
+              aggregate, weekly and trend pages, failures, coach (--progress adds the memo)
   progress    judge progression across the last N weekly reports (separate file)
   auth        store the token insights needs (--check to verify, --clear to remove)
   select      show what is in the window and how many sessions need facets
   failures    classify every failed tool call in the window (--json for the data)
+  coach       ranked, evidence-backed changes to CLAUDE.md and the allow list
   prepare     render the window's transcripts to text for facet extraction
   extract     extract canonical facets headless through claude -p, validated
   aggregate   build and save a snapshot of the window
@@ -115,6 +116,8 @@ func main() {
 		err = cmdSelect(os.Args[2:])
 	case "failures":
 		err = cmdFailures(os.Args[2:])
+	case "coach":
+		err = cmdCoach(os.Args[2:])
 	case "prepare":
 		err = cmdPrepare(os.Args[2:])
 	case "extract":
