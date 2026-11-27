@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/brianleach/weekly-insights/internal/auth"
+	"github.com/brianleach/weekly-insights/internal/coach"
 	"github.com/brianleach/weekly-insights/internal/extract"
 	"github.com/brianleach/weekly-insights/internal/failures"
 	"github.com/brianleach/weekly-insights/internal/model"
@@ -148,13 +149,15 @@ func cmdWeek(args []string) error {
 
 	// Aggregate reads the window again: insights harvests and extract writes
 	// facets, and both should count.
-	snap, sum, err := weekAggregate(p, o)
+	snap, fails, err := weekAggregate(p, o)
 	if err != nil {
 		step("aggregate", "", err, "aggregate")
 		step("weekly", "", nil, "skipped: aggregate failed")
 		step("trend", "", nil, "skipped: aggregate failed")
 		step("failures", "", nil, "skipped: aggregate failed")
+		step("coach", "", nil, "skipped: aggregate failed")
 	} else {
+		sum := failures.Summarize(fails, snap.Sessions.Substantive)
 		reason := fmt.Sprintf("snapshot %s saved, %d sessions", snap.Window.Label, snap.Sessions.Substantive)
 		if extractFailed {
 			reason += "; extract failed, so only the facets already on disk count"
@@ -173,6 +176,13 @@ func cmdWeek(args []string) error {
 		files["failures.txt"] = []byte(failures.Report(sum,
 			fmt.Sprintf("%s .. %s  (%dd)", m.Window.Start, m.Window.End, o.Days)))
 		step("failures", "failures.txt", nil, fmt.Sprintf("%d failed tool calls", sum.Total))
+		var name string
+		res, err := weekCoach(p, o, &snap, fails, *outDir, home, m.Window.End)
+		if err == nil {
+			name = "coach.html"
+			files[name] = []byte(coach.HTML(res, fmt.Sprintf("Coach %s .. %s (%dd)", m.Window.Start, m.Window.End, o.Days)))
+		}
+		step("coach", name, err, fmt.Sprintf("%d proposals", len(res.Proposals)))
 	}
 
 	if !*withProgress {
@@ -238,17 +248,33 @@ func weekExtract(ctx context.Context, p store.Paths, o window.Options, opts extr
 }
 
 // weekAggregate is aggregate without the printing: build, attach failures,
-// save.
-func weekAggregate(p store.Paths, o window.Options) (snapshot.Snapshot, failures.Summary, error) {
+// save. It returns the window's failures for the steps after it.
+func weekAggregate(p store.Paths, o window.Options) (snapshot.Snapshot, []failures.Failure, error) {
 	r, err := window.Select(p, o)
 	if err != nil {
-		return snapshot.Snapshot{}, failures.Summary{}, err
+		return snapshot.Snapshot{}, nil, err
 	}
 	snap := snapshot.Build(r, o.Days, nil)
-	sum := failures.Summarize(failures.Collect(p, r.Substantive), len(r.Substantive))
-	snap.Failures = failures.SnapshotSummary(sum)
+	fails := failures.Collect(p, r.Substantive)
+	snap.Failures = failures.SnapshotSummary(failures.Summarize(fails, len(r.Substantive)))
 	_, err = snapshot.Save(p, snap)
-	return snap, sum, err
+	return snap, fails, err
+}
+
+// weekCoach runs the coach over the snapshot aggregate just saved and writes
+// its proposals file beside the reports.
+func weekCoach(p store.Paths, o window.Options, snap *snapshot.Snapshot, fails []failures.Failure,
+	outDir, home, end string) (coach.Result, error) {
+	r, err := window.Select(p, o)
+	if err != nil {
+		return coach.Result{}, err
+	}
+	res, err := coachRun(p, o, r, fails, snap, resolveClaudeDir("", home))
+	if err != nil {
+		return res, err
+	}
+	_, err = writeProposals(outDir, o.Days, end, res)
+	return res, err
 }
 
 // previousSnapshot is the newest snapshot of the same window length before
