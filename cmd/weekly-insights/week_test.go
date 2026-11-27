@@ -241,3 +241,65 @@ func TestCmdInsightsStdoutIsReportPath(t *testing.T) {
 		t.Errorf("report: %v, %v", fi, err)
 	}
 }
+
+// TestCmdWeekDefaultsOutToHome pins the unset --out: the bundle lands in
+// ~/claude-weekly-insights.
+func TestCmdWeekDefaultsOutToHome(t *testing.T) {
+	args, out, _ := weekFixture(t)
+	stdout, err := captureStdout(t, func() error {
+		return cmdWeek([]string{"--root", args[1], "--days", "7", "--end", "2026-01-10",
+			"--skip-insights", "--skip-extract"})
+	})
+	if err != nil {
+		t.Fatalf("week: %v", err)
+	}
+	want := filepath.Join(out, "week-7d-2026-01-10", "index.html")
+	if strings.TrimSpace(stdout) != want {
+		t.Errorf("stdout = %q, want %q", strings.TrimSpace(stdout), want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("no bundle under the default out dir: %v", err)
+	}
+	if st := statuses(readBundle(t, filepath.Dir(want))); st["aggregate"] != "ok" {
+		t.Errorf("statuses = %v", st)
+	}
+}
+
+// TestCmdWeekNeedsAHomeDir covers the home lookup, both for the default root
+// and for the default out dir: without $HOME the command stops with that
+// reason and writes nothing.
+func TestCmdWeekNeedsAHomeDir(t *testing.T) {
+	args, _, _ := weekFixture(t)
+	root := args[1]
+	t.Setenv("HOME", "")
+	for _, a := range [][]string{
+		{"--root", root, "--days", "7", "--end", "2026-01-10", "--skip-insights", "--skip-extract"},
+		{"--days", "7", "--end", "2026-01-10", "--skip-insights", "--skip-extract"},
+	} {
+		stdout, err := captureStdout(t, func() error { return cmdWeek(a) })
+		if err == nil || !strings.Contains(err.Error(), "HOME") {
+			t.Errorf("cmdWeek(%v) = %v, want a $HOME error", a, err)
+		}
+		if stdout != "" {
+			t.Errorf("cmdWeek(%v) printed %q, want nothing", a, stdout)
+		}
+	}
+}
+
+// TestCmdWeekRejectsBadWindow covers the early exit on a window that cannot be
+// resolved: no step runs and no bundle is left behind.
+func TestCmdWeekRejectsBadWindow(t *testing.T) {
+	args, out, _ := weekFixture(t)
+	stdout, err := captureStdout(t, func() error {
+		return cmdWeek([]string{"--root", args[1], "--days", "7", "--end", "nope", "--out", out})
+	})
+	if err == nil {
+		t.Fatalf("want an error for --end nope, got nil (stdout %q)", stdout)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing printed", stdout)
+	}
+	if _, statErr := os.Stat(filepath.Join(out, "week-7d-2026-01-10")); !os.IsNotExist(statErr) {
+		t.Errorf("a bundle was written anyway: %v", statErr)
+	}
+}
