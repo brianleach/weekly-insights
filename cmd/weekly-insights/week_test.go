@@ -303,3 +303,116 @@ func TestCmdWeekRejectsBadWindow(t *testing.T) {
 		t.Errorf("a bundle was written anyway: %v", statErr)
 	}
 }
+
+// TestCmdWeekNotLoggedInHelpAndOpen covers the tail of the command: when the
+// model answers the way an unauthenticated CLI does, the setup help follows
+// the per-step diagnostics on stderr, and --open hands the bundle index to
+// the platform opener.
+func TestCmdWeekNotLoggedInHelpAndOpen(t *testing.T) {
+	args, out, _ := weekFixture(t)
+	// Two weekly reports, so the progress step runs instead of skipping.
+	if err := os.MkdirAll(out, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"2026-01-03", "2026-01-10"} {
+		page := "<html><body><h1>Claude Code Insights</h1><p>" + d + "</p></body></html>"
+		if err := os.WriteFile(filepath.Join(out, "insights-7d-"+d+".html"), []byte(page), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A claude that replies with the login prompt instead of doing the work,
+	// plus openers that record what they were asked to open.
+	bin := t.TempDir()
+	openLog := filepath.Join(t.TempDir(), "opened.log")
+	t.Setenv("FAKE_OPEN_LOG", openLog)
+	opener := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_OPEN_LOG\"\n"
+	for name, body := range map[string]string{
+		"claude": "#!/bin/sh\necho 'Invalid API key · Please run /login'\n" +
+			"echo 'You are not logged in. Please run claude login or claude setup-token.'\n" +
+			"while IFS= read -r l; do :; done\nexit 0\n",
+		"open": opener, "xdg-open": opener, "x-www-browser": opener, "sensible-browser": opener,
+	} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	errFile, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = errFile
+	stdout, runErr := captureStdout(t, func() error {
+		return cmdWeek(append(args, "--progress", "--open"))
+	})
+	os.Stderr = saved
+	errFile.Close()
+	diag, err := os.ReadFile(errFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if runErr == nil {
+		t.Errorf("err = nil, want the failed model calls reported")
+	}
+	index := filepath.Join(out, "week-7d-2026-01-10", "index.html")
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if lines[len(lines)-1] != index {
+		t.Errorf("last stdout line = %q, want %q", lines[len(lines)-1], index)
+	}
+	// The setup help is printed once the steps are done, so it follows the
+	// last failed-step line on stderr.
+	if i := strings.LastIndex(string(diag), "week: "); i < 0 {
+		t.Fatalf("no failed step on stderr:\n%s", diag)
+	} else if _, after, _ := strings.Cut(string(diag)[i:], "\n"); strings.TrimSpace(after) == "" {
+		t.Errorf("nothing follows the failed steps on stderr, want the setup help:\n%s", diag)
+	}
+
+	// The opener may be started without being waited on, so wait for its
+	// record against a wall-clock deadline, using a touched file as the clock.
+	clock := filepath.Join(t.TempDir(), "clock")
+	if err := os.WriteFile(clock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, opened := fi.ModTime(), []byte(nil)
+	for {
+		if b, _ := os.ReadFile(openLog); len(b) > 0 {
+			opened = b
+			break
+		}
+		if err := os.WriteFile(clock, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if now, err := os.Stat(clock); err == nil && now.ModTime().Sub(start).Seconds() > 5 {
+			break
+		}
+	}
+	if !strings.Contains(string(opened), index) {
+		t.Errorf("--open handed %q to the opener, want %s", opened, index)
+	}
+}
+
+// TestCmdWeekReportsAnUnwritableOutDir covers the bundle write failing: the
+// command returns that reason and prints no index.
+func TestCmdWeekReportsAnUnwritableOutDir(t *testing.T) {
+	args, out, _ := weekFixture(t)
+	if err := os.WriteFile(out, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := captureStdout(t, func() error {
+		return cmdWeek([]string{"--root", args[1], "--days", "7", "--end", "2026-01-10",
+			"--out", out, "--skip-insights", "--skip-extract"})
+	})
+	if err == nil || !strings.Contains(err.Error(), out) {
+		t.Fatalf("err = %v, want it to name %s", err, out)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing printed", stdout)
+	}
+}

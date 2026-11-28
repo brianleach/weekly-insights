@@ -116,3 +116,17 @@ func assertFinite(t *testing.T, got string) {
 		}
 	}
 }
+
+func TestPrevMeanNoSeries(t *testing.T) {
+	if m, ok := prevMean(nil); ok || m != 0 {
+		t.Errorf("prevMean(nil) = (%v, %v), want (0, false)", m, ok)
+	}
+	if m, ok := prevMean([]series{}); ok || m != 0 {
+		t.Errorf("prevMean(empty) = (%v, %v), want (0, false)", m, ok)
+	}
+	got := lineChart(nil, chartOpts{title: "x", weeks: []string{"a", "b"}})
+	assertFinite(t, got)
+	if strings.Contains(got, "4-wk mean") || strings.Contains(got, "--wi-baseline") {
+		t.Errorf("no series means no baseline:\n%s", got)
+	}
+}
